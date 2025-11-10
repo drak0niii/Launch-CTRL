@@ -1,5 +1,0 @@
-# example: Node + general
-node_modules/
-.env
-dist/
-build/

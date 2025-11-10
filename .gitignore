@@ -1,5 +1,18 @@
+# Environment and secret files
 .env
-.env.local
-.env.production
+.env.*
 *.pem
-*.key private/
+*.key
+*.pfx
+
+# Node / React / Vite / TypeScript
+node_modules/
+dist/
+build/
+.vite/
+*.log
+
+# VS Code and system files
+.vscode/
+.DS_Store
+Thumbs.db
