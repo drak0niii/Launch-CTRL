@@ -2,5 +2,4 @@
 .env.local
 .env.production
 *.pem
-*.key
-private/
+*.key private/
