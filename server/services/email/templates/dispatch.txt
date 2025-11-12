@@ -1,0 +1,21 @@
+Subject: [DISPATCH] {{siteId}} – {{cause}} – Action Required
+
+Dear Field Operations,
+
+An unresolved issue has been detected at site {{siteId}} requiring on-site verification.
+
+Summary:
+{{summary}}
+
+Details:
+Cause: {{cause}}
+Resolution Attempted: {{resolution}}
+
+---
+{{body}}
+---
+
+Please dispatch field personnel to assess the site and confirm service restoration.
+
+Thank you,
+Supervisor (Launch-CTRL)

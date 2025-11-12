@@ -1,0 +1,402 @@
+{
+  "id": "command-console",
+  "createdAt": "2025-11-12T18:20:08.983Z",
+  "updatedAt": "2025-11-12T20:37:59.649Z",
+  "notes": [
+    "Agent A = Correlation Agent",
+    "Agent B = Troubleshooting Agent",
+    "Agent C = Dispatch Agent",
+    "Delegation must remain disabled for Agent A by policy."
+  ],
+  "tags": {
+    "delegationPolicyAgentA": "disabled",
+    "systemName": "Launch CTRL"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "supervisor start",
+      "timestamp": "2025-11-12T18:20:08.987Z",
+      "ts": "2025-11-12T18:20:08.987Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor: RUNNING • runtime 0s",
+      "timestamp": "2025-11-12T18:20:09.894Z",
+      "ts": "2025-11-12T18:20:09.894Z"
+    },
+    {
+      "role": "user",
+      "content": "a start",
+      "timestamp": "2025-11-12T18:20:12.590Z",
+      "ts": "2025-11-12T18:20:12.590Z"
+    },
+    {
+      "role": "assistant",
+      "content": "✅ Agent CORRELATION started.",
+      "timestamp": "2025-11-12T18:20:13.453Z",
+      "ts": "2025-11-12T18:20:13.453Z"
+    },
+    {
+      "role": "user",
+      "content": "b start",
+      "timestamp": "2025-11-12T18:20:16.216Z",
+      "ts": "2025-11-12T18:20:16.216Z"
+    },
+    {
+      "role": "assistant",
+      "content": "✅ Agent TROUBLESHOOTING started.",
+      "timestamp": "2025-11-12T18:20:16.893Z",
+      "ts": "2025-11-12T18:20:16.893Z"
+    },
+    {
+      "role": "user",
+      "content": "c start",
+      "timestamp": "2025-11-12T18:20:18.747Z",
+      "ts": "2025-11-12T18:20:18.747Z"
+    },
+    {
+      "role": "assistant",
+      "content": "✅ Agent RCA started.",
+      "timestamp": "2025-11-12T18:20:20.170Z",
+      "ts": "2025-11-12T18:20:20.170Z"
+    },
+    {
+      "role": "user",
+      "content": "status super",
+      "timestamp": "2025-11-12T18:21:44.173Z",
+      "ts": "2025-11-12T18:21:44.173Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor status: running • runtime 95s • tasks 27",
+      "timestamp": "2025-11-12T18:21:45.264Z",
+      "ts": "2025-11-12T18:21:45.264Z"
+    },
+    {
+      "role": "user",
+      "content": "status super",
+      "timestamp": "2025-11-12T18:21:49.112Z",
+      "ts": "2025-11-12T18:21:49.112Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor status: running • runtime 99s • tasks 27",
+      "timestamp": "2025-11-12T18:21:49.761Z",
+      "ts": "2025-11-12T18:21:49.761Z"
+    },
+    {
+      "role": "user",
+      "content": "status rca ?",
+      "timestamp": "2025-11-12T18:21:53.314Z",
+      "ts": "2025-11-12T18:21:53.314Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent RCA status: Active • tasks 24",
+      "timestamp": "2025-11-12T18:21:54.288Z",
+      "ts": "2025-11-12T18:21:54.288Z"
+    },
+    {
+      "role": "user",
+      "content": "status a",
+      "timestamp": "2025-11-12T18:21:59.878Z",
+      "ts": "2025-11-12T18:21:59.878Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent CORRELATION status: Active • tasks 182",
+      "timestamp": "2025-11-12T18:22:01.176Z",
+      "ts": "2025-11-12T18:22:01.176Z"
+    },
+    {
+      "role": "user",
+      "content": "status supervisr",
+      "timestamp": "2025-11-12T20:10:50.001Z",
+      "ts": "2025-11-12T20:10:50.001Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor status: idle • runtime 0s • tasks 0",
+      "timestamp": "2025-11-12T20:10:51.268Z",
+      "ts": "2025-11-12T20:10:51.268Z"
+    },
+    {
+      "role": "user",
+      "content": "start sipervisor",
+      "timestamp": "2025-11-12T20:10:58.612Z",
+      "ts": "2025-11-12T20:10:58.612Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor: RUNNING • runtime 0s",
+      "timestamp": "2025-11-12T20:10:59.894Z",
+      "ts": "2025-11-12T20:10:59.894Z"
+    },
+    {
+      "role": "user",
+      "content": "start a",
+      "timestamp": "2025-11-12T20:11:02.588Z",
+      "ts": "2025-11-12T20:11:02.588Z"
+    },
+    {
+      "role": "assistant",
+      "content": "✅ Agent CORRELATION started.",
+      "timestamp": "2025-11-12T20:11:03.909Z",
+      "ts": "2025-11-12T20:11:03.909Z"
+    },
+    {
+      "role": "user",
+      "content": "starr b",
+      "timestamp": "2025-11-12T20:11:11.192Z",
+      "ts": "2025-11-12T20:11:11.192Z"
+    },
+    {
+      "role": "assistant",
+      "content": "✅ Agent TROUBLESHOOTING started.",
+      "timestamp": "2025-11-12T20:11:13.186Z",
+      "ts": "2025-11-12T20:11:13.186Z"
+    },
+    {
+      "role": "user",
+      "content": "start c",
+      "timestamp": "2025-11-12T20:11:15.354Z",
+      "ts": "2025-11-12T20:11:15.354Z"
+    },
+    {
+      "role": "assistant",
+      "content": "✅ Agent RCA started.",
+      "timestamp": "2025-11-12T20:11:16.035Z",
+      "ts": "2025-11-12T20:11:16.035Z"
+    },
+    {
+      "role": "user",
+      "content": "status a",
+      "timestamp": "2025-11-12T20:22:59.683Z",
+      "ts": "2025-11-12T20:22:59.683Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent CORRELATION status: Stopped • tasks 47",
+      "timestamp": "2025-11-12T20:23:00.487Z",
+      "ts": "2025-11-12T20:23:00.487Z"
+    },
+    {
+      "role": "user",
+      "content": "status b",
+      "timestamp": "2025-11-12T20:23:04.083Z",
+      "ts": "2025-11-12T20:23:04.083Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent TROUBLESHOOTING status: Stopped • tasks 0",
+      "timestamp": "2025-11-12T20:23:05.494Z",
+      "ts": "2025-11-12T20:23:05.494Z"
+    },
+    {
+      "role": "user",
+      "content": "status c",
+      "timestamp": "2025-11-12T20:23:08.526Z",
+      "ts": "2025-11-12T20:23:08.526Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent RCA status: Stopped • tasks 0",
+      "timestamp": "2025-11-12T20:23:09.294Z",
+      "ts": "2025-11-12T20:23:09.294Z"
+    },
+    {
+      "role": "user",
+      "content": "status supervisor",
+      "timestamp": "2025-11-12T20:23:19.090Z",
+      "ts": "2025-11-12T20:23:19.090Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor status: idle • runtime 0s • tasks 0",
+      "timestamp": "2025-11-12T20:23:20.575Z",
+      "ts": "2025-11-12T20:23:20.575Z"
+    },
+    {
+      "role": "user",
+      "content": "start supervisor",
+      "timestamp": "2025-11-12T20:24:46.929Z",
+      "ts": "2025-11-12T20:24:46.929Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor: RUNNING • runtime 0s",
+      "timestamp": "2025-11-12T20:24:47.641Z",
+      "ts": "2025-11-12T20:24:47.641Z"
+    },
+    {
+      "role": "user",
+      "content": "status supervisor",
+      "timestamp": "2025-11-12T20:27:17.114Z",
+      "ts": "2025-11-12T20:27:17.114Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor status: running • runtime 150s • tasks 18",
+      "timestamp": "2025-11-12T20:27:17.915Z",
+      "ts": "2025-11-12T20:27:17.915Z"
+    },
+    {
+      "role": "user",
+      "content": "status a",
+      "timestamp": "2025-11-12T20:27:22.257Z",
+      "ts": "2025-11-12T20:27:22.257Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent CORRELATION status: Active • tasks 104",
+      "timestamp": "2025-11-12T20:27:23.764Z",
+      "ts": "2025-11-12T20:27:23.764Z"
+    },
+    {
+      "role": "user",
+      "content": "status b",
+      "timestamp": "2025-11-12T20:27:27.418Z",
+      "ts": "2025-11-12T20:27:27.418Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent TROUBLESHOOTING status: Active • tasks 18",
+      "timestamp": "2025-11-12T20:27:28.350Z",
+      "ts": "2025-11-12T20:27:28.350Z"
+    },
+    {
+      "role": "user",
+      "content": "status c",
+      "timestamp": "2025-11-12T20:27:36.040Z",
+      "ts": "2025-11-12T20:27:36.040Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent RCA status: Active • tasks 18",
+      "timestamp": "2025-11-12T20:27:37.166Z",
+      "ts": "2025-11-12T20:27:37.166Z"
+    },
+    {
+      "role": "user",
+      "content": "status supervisor",
+      "timestamp": "2025-11-12T20:33:02.309Z",
+      "ts": "2025-11-12T20:33:02.309Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor status: running • runtime 495s • tasks 18",
+      "timestamp": "2025-11-12T20:33:03.047Z",
+      "ts": "2025-11-12T20:33:03.047Z"
+    },
+    {
+      "role": "user",
+      "content": "pause supervisor",
+      "timestamp": "2025-11-12T20:33:10.124Z",
+      "ts": "2025-11-12T20:33:10.124Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor: PAUSED • runtime 503s",
+      "timestamp": "2025-11-12T20:33:10.817Z",
+      "ts": "2025-11-12T20:33:10.817Z"
+    },
+    {
+      "role": "user",
+      "content": "status supervisor",
+      "timestamp": "2025-11-12T20:33:15.499Z",
+      "ts": "2025-11-12T20:33:15.499Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor status: paused • runtime 503s • tasks 18",
+      "timestamp": "2025-11-12T20:33:16.204Z",
+      "ts": "2025-11-12T20:33:16.204Z"
+    },
+    {
+      "role": "user",
+      "content": "status supervisorr",
+      "timestamp": "2025-11-12T20:36:00.319Z",
+      "ts": "2025-11-12T20:36:00.319Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor status: idle • runtime 0s • tasks 0",
+      "timestamp": "2025-11-12T20:36:02.095Z",
+      "ts": "2025-11-12T20:36:02.095Z"
+    },
+    {
+      "role": "user",
+      "content": "start supervisor",
+      "timestamp": "2025-11-12T20:36:08.108Z",
+      "ts": "2025-11-12T20:36:08.108Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor: RUNNING • runtime 0s",
+      "timestamp": "2025-11-12T20:36:09.301Z",
+      "ts": "2025-11-12T20:36:09.301Z"
+    },
+    {
+      "role": "user",
+      "content": "pause supervisor",
+      "timestamp": "2025-11-12T20:37:38.364Z",
+      "ts": "2025-11-12T20:37:38.364Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor: PAUSED • runtime 90s",
+      "timestamp": "2025-11-12T20:37:39.864Z",
+      "ts": "2025-11-12T20:37:39.864Z"
+    },
+    {
+      "role": "user",
+      "content": "status a",
+      "timestamp": "2025-11-12T20:37:42.789Z",
+      "ts": "2025-11-12T20:37:42.789Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent CORRELATION status: Active • tasks 66",
+      "timestamp": "2025-11-12T20:37:43.869Z",
+      "ts": "2025-11-12T20:37:43.869Z"
+    },
+    {
+      "role": "user",
+      "content": "status b",
+      "timestamp": "2025-11-12T20:37:46.726Z",
+      "ts": "2025-11-12T20:37:46.726Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent TROUBLESHOOTING status: Active • tasks 3",
+      "timestamp": "2025-11-12T20:37:47.767Z",
+      "ts": "2025-11-12T20:37:47.767Z"
+    },
+    {
+      "role": "user",
+      "content": "status c",
+      "timestamp": "2025-11-12T20:37:50.125Z",
+      "ts": "2025-11-12T20:37:50.125Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧩 Agent RCA status: Active • tasks 6",
+      "timestamp": "2025-11-12T20:37:51.053Z",
+      "ts": "2025-11-12T20:37:51.053Z"
+    },
+    {
+      "role": "user",
+      "content": "status supervisor",
+      "timestamp": "2025-11-12T20:37:55.661Z",
+      "ts": "2025-11-12T20:37:55.661Z"
+    },
+    {
+      "role": "assistant",
+      "content": "🧠 Supervisor status: paused • runtime 90s • tasks 3",
+      "timestamp": "2025-11-12T20:37:59.649Z",
+      "ts": "2025-11-12T20:37:59.649Z"
+    }
+  ],
+  "summaries": []
+}

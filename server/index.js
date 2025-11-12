@@ -3,28 +3,99 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import OpenAI from 'openai';
+
+// Top-level utility routes
+import logsRoutes from './routes/logs.routes.js';
+import rcaRoutes from './routes/rca.routes.js';               // /api/rca  (top-level RCA)
+
+// System state (for console tools)
 import { getSystemState, setSystemEnabled, subscribe } from './system/state.js';
 
-// Memory helpers (unchanged)
+// Policy + Supervisor
+import policyRoutes from './policy/routes.js';
+import supervisorRoutes from './supervisor/routes.js';
+import { getPolicy } from './policy/store.js';
+
+// Agent routers (agent-scoped)
+import correlationRoutes from './agents/correlation.routes.js';
+import troubleshootingRoutes from './agents/troubleshooting.routes.js';
+import rcaAgentRoutes from './agents/rca.routes.js';          // alias to avoid name clash
+
+// Tower bridge + routes
+import towerRoutes from './tower/routes.js';
+import { initTowerBridge } from './tower/bridge.js';
+
+// Incident bus (SSE) routes
+import busRoutes from './bus/incidentBus.routes.js';
+
+// Pipeline wiring
+import { initPipeline } from './supervisor/pipeline.js';
+
+// ✅ use the real exports from supervisor/store.js
+import {
+  summary as supervisorSummary,
+  start as supervisorStart,
+  stop as supervisorStop,
+  pause as supervisorPause,
+  resume as supervisorResume,
+} from './supervisor/store.js';
+
+// Memory helpers (console)
 import {
   loadConsoleMemory,
   appendMessage,
   addNote,
   setTag,
   resetConsoleMemory,
-  getRecentConsoleMessages,     // ⬅️ NEW: expose recent transcript for LLM tool
+  getRecentConsoleMessages,
 } from './memory/storage.js';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// --- mount routes ---
+app.use('/api/policy', policyRoutes);
+app.use('/api/supervisor', supervisorRoutes);
+app.use('/api/agents/correlation', correlationRoutes);
+app.use('/api/agents/troubleshooting', troubleshootingRoutes);
+app.use('/api/agents/rca', rcaAgentRoutes);   // <- agent-scoped RCA routes
+app.use('/api/tower', towerRoutes);
+app.use('/api/bus', busRoutes);
+app.use('/api/logs', logsRoutes);
+app.use('/api/rca', rcaRoutes);               // <- top-level RCA routes
+
+// --- tower bridge + pipeline init ---
+initTowerBridge();
+// pass a getter that returns the latest supervisor summary
+initPipeline({ getSupervisor: supervisorSummary });
+
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+
+
 /* =======================================================================================
- * Small helpers for uniform, fresh JSON
- * =======================================================================================
- */
+ * Console behavior rules (single source of truth)
+ * ======================================================================================= */
+const CONSOLE_BEHAVIOR_PROMPT = `
+You are the Command Console Assistant for the Launch-CTRL system.
+
+Your role:
+- Interpret console commands (power on/off, status queries, connection toggles, supervisor start/pause/resume/stop, etc.).
+- For casual conversation (greetings, identity questions, small talk), respond politely and briefly, then offer "Type \`help\` to see available commands."
+
+Strict rules (very important):
+- Never count how many times the user said or asked something.
+- Do not perform meta-analysis of the chat (e.g., "you said X N times").
+- When referring to a prior user message, DO NOT quote it verbatim; paraphrase ("that question", "your greeting") instead.
+- If you must reason over conversation history, consider ONLY user messages; ignore assistant messages for any counts or stats.
+- For system facts (online/offline, counts on/off, version, last update, history, uptime), always use the system tool output; do not guess numbers.
+- Keep responses concise and focused on console operations.
+`;
+
+/* =======================================================================================
+ * Helpers
+ * ======================================================================================= */
 function fresh(res) {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
@@ -38,17 +109,20 @@ function err(message, extra = {}) {
   return { ok: false, serverTime: new Date().toISOString(), error: message, ...extra };
 }
 
-// --- health ping ---
-app.get('/health', (_req, res) => {
-  fresh(res).json(ok());
+// --- Health (now also returns supervisor snapshot) ---
+app.get('/api/health', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.status(200).json({
+    ok: true,
+    service: 'Launch-CTRL server',
+    ts: new Date().toISOString(),
+    supervisor: supervisorSummary(),
+  });
 });
 
 /* =======================================================================================
- * Helpers
- * =======================================================================================
- */
-
-// Minimal regex safety net (kept; LLM should handle most cases)
+ * Intent parsing + LLM helpers
+ * ======================================================================================= */
 function parseSystemIntent(prompt = '') {
   const p = String(prompt).toLowerCase();
   const off =
@@ -65,11 +139,26 @@ function parseSystemIntent(prompt = '') {
   return { match: false };
 }
 
-/**
- * Intent classifier tailored to the dashboard assistant.
- * Adds `system_query` so the LLM can understand questions like:
- *  - "is the system online?", "uptime", "history", etc.
- */
+// agent alias mapper (A/B/C or names)
+function mapAgent(a = '') {
+  const t = String(a).toLowerCase();
+  if (t === 'a' || t.includes('correlation')) return 'correlation';
+  if (t === 'b' || t.includes('troubleshooting') || t.includes('mitigation')) return 'troubleshooting';
+  if (t === 'c' || t === 'rca' || t.includes('dispatch')) return 'rca';
+  return null;
+}
+
+// approvals regex fallback
+function parseApprovalFallback(prompt = '') {
+  const p = String(prompt).trim();
+  const approve = p.match(/^\s*(approve|accept)\s*#?\s*(\d+)\s*$/i);
+  if (approve) return { intent: 'approvals', action: 'approve', id: Number(approve[2]) };
+  const reject = p.match(/^\s*(reject|deny|decline)\s*#?\s*(\d+)\s*$/i);
+  if (reject) return { intent: 'approvals', action: 'reject', id: Number(reject[2]) };
+  if (/^\s*(list|show)\s+(approval|approvals)\s*$/i.test(p)) return { intent: 'approvals', action: 'list' };
+  return null;
+}
+
 async function classifyIntentLLM(prompt) {
   const sys = `
 You are the intent brain for a dashboard command console. Classify the user's line into a console intent.
@@ -79,46 +168,14 @@ Return ONLY a JSON object (no prose) in exactly one of these shapes (no extra ke
 {"intent":"system_query","aspect":"status"|"count_on"|"count_off"|"version"|"last_updated"|"history"|"uptime"|"uptime_minutes"}
 {"intent":"toggle_connections","action":"on"|"off"|"toggle"}
 {"intent":"console_panel","action":"expand"|"collapse"}
+{"intent":"policy_query","aspect":"version"|"values"|"last_updated"}
+{"intent":"supervisor_control","action":"start"|"pause"|"resume"|"stop"}
+{"intent":"supervisor_query","aspect":"status"}
+{"intent":"supervisor_auto","enabled":true|false}
+{"intent":"agent_control","agent":"a"|"b"|"c"|"correlation"|"troubleshooting"|"rca","action":"start"|"stop"}
+{"intent":"agent_query","agent":"a"|"b"|"c"|"correlation"|"troubleshooting"|"rca","aspect":"status"|"logs_url"}
+{"intent":"approvals","action":"list"|"approve"|"reject","id"?:number}
 {"intent":"none"}
-
-Rules:
-- If the user asks about uptime/for how long it's been up (including “uptime in minutes”), classify as:
-  - {"intent":"system_query","aspect":"uptime"} or {"intent":"system_query","aspect":"uptime_minutes"}.
-- Do NOT classify uptime questions as "status".
-- If they ask for current online/offline state, classify as {"intent":"system_query","aspect":"status"}.
-- Only classify "system_power" when they're clearly asking to change state (turn on/off, power up/down, start/stop).
-- Be robust to typos, synonyms, and indirect phrasing.
-
-MAPPING EXAMPLES
-// Queries
-"is the system online?"                      -> {"intent":"system_query","aspect":"status"}
-"what's the system status?"                  -> {"intent":"system_query","aspect":"status"}
-"are we up?"                                 -> {"intent":"system_query","aspect":"status"}
-"how many times did I turn it on?"           -> {"intent":"system_query","aspect":"count_on"}
-"how many times off?"                        -> {"intent":"system_query","aspect":"count_off"}
-"what version is the system state?"          -> {"intent":"system_query","aspect":"version"}
-"when was the last change?"                  -> {"intent":"system_query","aspect":"last_updated"}
-"show history"                               -> {"intent":"system_query","aspect":"history"}
-
-// Uptime-specific (must NOT map to status)
-"what is the uptime?"                        -> {"intent":"system_query","aspect":"uptime"}
-"for how long has it been up?"               -> {"intent":"system_query","aspect":"uptime"}
-"uptime in minutes"                          -> {"intent":"system_query","aspect":"uptime_minutes"}
-"give me the dashboard uptime"               -> {"intent":"system_query","aspect":"uptime"}
-"how long online since last start?"          -> {"intent":"system_query","aspect":"uptime"}
-
-// Controls
-"power it down"                              -> {"intent":"system_power","action":"off"}
-"turn system offline"                        -> {"intent":"system_power","action":"off"}
-"bring it back online"                       -> {"intent":"system_power","action":"on"}
-"start the system"                           -> {"intent":"system_power","action":"on"}
-"show connections"                           -> {"intent":"toggle_connections","action":"on"}
-"hide connections"                           -> {"intent":"toggle_connections","action":"off"}
-"toggle links"                               -> {"intent":"toggle_connections","action":"toggle"}
-"expand console"                             -> {"intent":"console_panel","action":"expand"}
-"minimize console"                           -> {"intent":"console_panel","action":"collapse"}
-
-If the line is a greeting, a general question, or unclear, return {"intent":"none"}.
 `.trim();
 
   try {
@@ -128,21 +185,6 @@ If the line is a greeting, a general question, or unclear, return {"intent":"non
       response_format: { type: 'json_object' },
       messages: [
         { role: 'system', content: sys },
-
-        // A few concise anchors to minimize drift
-        { role: 'user', content: 'what is the uptime?' },
-        { role: 'assistant', content: '{"intent":"system_query","aspect":"uptime"}' },
-
-        { role: 'user', content: 'uptime in minutes' },
-        { role: 'assistant', content: '{"intent":"system_query","aspect":"uptime_minutes"}' },
-
-        { role: 'user', content: 'is the system online?' },
-        { role: 'assistant', content: '{"intent":"system_query","aspect":"status"}' },
-
-        { role: 'user', content: 'power it down' },
-        { role: 'assistant', content: '{"intent":"system_power","action":"off"}' },
-
-        // Real query
         { role: 'user', content: String(prompt) },
       ],
     });
@@ -151,13 +193,10 @@ If the line is a greeting, a general question, or unclear, return {"intent":"non
     const text = raw.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
     const data = JSON.parse(text);
     if (data && typeof data === 'object' && data.intent) return data;
-  } catch {
-    // fall through to regex (for power only)
-  }
+  } catch { /* ignore */ }
   return { intent: 'none' };
 }
 
-// Build a short preamble from memory
 function buildMemoryPreamble(mem) {
   return [
     'You are the Command Console Assistant for Launch CTRL.',
@@ -174,7 +213,6 @@ function buildMemoryPreamble(mem) {
   ].join('\n');
 }
 
-/* -------------------- Authoritative snapshot helpers -------------------- */
 function buildSystemSnapshotLine(state = getSystemState(), extras = {}) {
   const { enabled, version, updatedAt } = state || {};
   const serverTime = new Date().toISOString();
@@ -191,7 +229,7 @@ function buildSystemSnapshotLine(state = getSystemState(), extras = {}) {
 }
 
 function formatSystemQuery(aspect) {
-  const s = getSystemState(); // { enabled, version, updatedAt, counts, history, uptimeSeconds, ... }
+  const s = getSystemState();
   switch (aspect) {
     case 'status':
       return `The system is ${s.enabled ? 'Online ✅' : 'Offline ⛔'} (v${s.version}, updated ${s.updatedAt}).`;
@@ -222,21 +260,33 @@ function formatSystemQuery(aspect) {
     }
     case 'uptime_minutes': {
       const mins = Math.floor(Number(s.uptimeSeconds || 0) / 60);
-      return s.enabled
-        ? `Uptime: ${mins} minute(s).`
-        : `The system is Offline ⛔. Uptime is 0 minutes while offline.`;
+      return s.enabled ? `Uptime: ${mins} minute(s).` : `The system is Offline ⛔. Uptime is 0 minutes while offline.`;
     }
     default:
       return `The system is ${s.enabled ? 'Online ✅' : 'Offline ⛔'} (v${s.version}, updated ${s.updatedAt}).`;
   }
 }
 
-/* -------------------- LLM Tools: let the model fetch live state + transcript -------------------- */
+function formatPolicyQuery(aspect) {
+  const p = getPolicy();
+  switch (aspect) {
+    case 'version':
+      return `Policy version v${p.version ?? 0}.`;
+    case 'last_updated':
+      return `Policy last updated at ${p.updatedAt ?? 'unknown'}.`;
+    case 'values':
+      return `Active policy → Alarm: ${p.alarmPrioritization}, WoW: ${p.waysOfWorking}, KPI: ${p.kpiAlignment} (v${p.version ?? 0}, updated ${p.updatedAt ?? 'unknown'}).`;
+    default:
+      return `Policy version v${p.version ?? 0} (updated ${p.updatedAt ?? 'unknown'}).`;
+  }
+}
+
+/* -------------------- LLM Tools -------------------- */
 const LLM_TOOLS = [
   {
     type: 'function',
     function: {
-      name: 'get_system_state', // ✅ valid: only letters/numbers/_/-
+      name: 'get_system_state',
       description:
         'Return the authoritative live system state (enabled, version, updatedAt, lastOnAt, lastOffAt, uptimeSeconds, counts, history[≤200]).',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
@@ -245,30 +295,18 @@ const LLM_TOOLS = [
   {
     type: 'function',
     function: {
-      name: 'get_console_messages', // ✅ valid
+      name: 'get_console_messages',
       description:
-        'Return a slice of the recent console transcript so you can compute conversation stats. Each item: { role, content, timestamp }. Use to answer questions like how many times the user greeted, what they said, etc.',
+        'Return recent console transcript items: { role, content, timestamp }. When computing any conversation statistic, count ONLY items where role === "user".',
       parameters: {
         type: 'object',
-        properties: {
-          limit: {
-            type: 'integer',
-            minimum: 1,
-            maximum: 500,
-            description: 'Max number of recent messages to return. Default 200.',
-          },
-        },
+        properties: { limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max number of messages.' } },
         additionalProperties: false,
       },
     },
   },
 ];
 
-/**
- * Two-pass tool runner:
- *  - Pass 1: let the model decide whether to call one or more tools
- *  - We execute the calls and return Pass 2 with tool outputs for a grounded answer
- */
 async function runLLMWithTools(messages) {
   const first = await client.chat.completions.create({
     model: 'gpt-4o-mini',
@@ -281,9 +319,7 @@ async function runLLMWithTools(messages) {
   const assistantMsg = first.choices?.[0]?.message;
   const calls = assistantMsg?.tool_calls ?? [];
 
-  if (!calls.length) {
-    return assistantMsg?.content ?? '';
-  }
+  if (!calls.length) return assistantMsg?.content ?? '';
 
   const toolMessages = [];
   for (const call of calls) {
@@ -293,35 +329,20 @@ async function runLLMWithTools(messages) {
     try {
       if (toolName === 'get_system_state') {
         const state = getSystemState();
-        toolMessages.push({
-          role: 'tool',
-          tool_call_id: call.id,
-          content: JSON.stringify(state),
-        });
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(state) });
       } else if (toolName === 'get_console_messages') {
         let limit = 200;
         if (rawArgs) {
           try {
             const parsed = JSON.parse(rawArgs);
-            if (Number.isInteger(parsed?.limit) && parsed.limit >= 1 && parsed.limit <= 500) {
-              limit = parsed.limit;
-            }
-          } catch { /* ignore parse errors; use default */ }
+            if (Number.isInteger(parsed?.limit) && parsed.limit >= 1 && parsed.limit <= 500) limit = parsed.limit;
+          } catch { /* ignore */ }
         }
         const msgs = await getRecentConsoleMessages(limit);
-        toolMessages.push({
-          role: 'tool',
-          tool_call_id: call.id,
-          content: JSON.stringify({ messages: msgs }),
-        });
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ messages: msgs }) });
       }
     } catch (e) {
-      // Return a structured tool error so the model can gracefully handle it
-      toolMessages.push({
-        role: 'tool',
-        tool_call_id: call.id,
-        content: JSON.stringify({ error: String(e?.message || e || 'tool_error') }),
-      });
+      toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: String(e?.message || e || 'tool_error') }) });
     }
   }
 
@@ -339,11 +360,8 @@ async function runLLMWithTools(messages) {
 }
 
 /* =======================================================================================
- * Command Console endpoints (PERSISTENT MEMORY + SEMANTIC INTENT ROUTING)
- * =======================================================================================
- */
-
-// Non-streaming (executes side-effects immediately for console intents)
+ * Command Console endpoints
+ * ======================================================================================= */
 app.post('/api/console', async (req, res) => {
   try {
     const { prompt, system } = req.body ?? {};
@@ -353,24 +371,63 @@ app.post('/api/console', async (req, res) => {
 
     await appendMessage('user', prompt);
 
-    // 1) Semantic classification
     let intentData = await classifyIntentLLM(prompt);
-
-    // 2) Regex fallback only for system power if LLM abstains
+    if (!intentData || intentData.intent === 'none') {
+      const fbApp = parseApprovalFallback(prompt);
+      if (fbApp) intentData = fbApp;
+    }
     if (!intentData || intentData.intent === 'none') {
       const fb = parseSystemIntent(prompt);
       if (fb.match) intentData = { intent: fb.intent, action: fb.action };
     }
 
-    // 3A) Execute console control intents
+    // approvals
+    if (intentData.intent === 'approvals') {
+      if (intentData.action === 'list') {
+        const r = await fetch('http://localhost:8787/api/supervisor/approvals');
+        const j = await r.json().catch(() => ({}));
+        const items = Array.isArray(j?.approvals) ? j.approvals : [];
+        const lines = items.length
+          ? items.map(a => `#${a.id} • ${a.siteId} • ${a.status} • ${a.reason || 'n/a'}`).join('\n- ')
+          : 'No pending approvals.';
+        const txt = items.length ? `Pending approvals:\n- ${lines}` : 'No pending approvals.';
+        await appendMessage('assistant', txt);
+        return fresh(res).json(ok({ text: txt, result: j }));
+      }
+      if (intentData.action === 'approve' && Number.isInteger(intentData.id)) {
+        const r = await fetch(`http://localhost:8787/api/supervisor/approvals/${intentData.id}/approve`, { method: 'POST' });
+        const j = await r.json().catch(() => ({}));
+        const txt = j?.ok ? `✅ Approved #${intentData.id}.` : `⚠️ Could not approve #${intentData.id}.`;
+        await appendMessage('assistant', txt);
+        return fresh(res).status(j?.ok ? 200 : 409).json(ok({ text: txt, result: j }));
+      }
+      if (intentData.action === 'reject' && Number.isInteger(intentData.id)) {
+        const r = await fetch(`http://localhost:8787/api/supervisor/approvals/${intentData.id}/reject`, { method: 'POST' });
+        const j = await r.json().catch(() => ({}));
+        const txt = j?.ok ? `🛑 Rejected #${intentData.id}.` : `⚠️ Could not reject #${intentData.id}.`;
+        await appendMessage('assistant', txt);
+        return fresh(res).status(j?.ok ? 200 : 409).json(ok({ text: txt, result: j }));
+      }
+    }
+
+    // supervisor auto on/off
+    if (intentData.intent === 'supervisor_auto') {
+      const body = JSON.stringify({ enabled: !!intentData.enabled });
+      const r = await fetch(`http://localhost:8787/api/supervisor/auto`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+      });
+      const j = await r.json().catch(() => ({}));
+      const ack = r.ok
+        ? `🤖 Auto pipeline ${intentData.enabled ? 'enabled' : 'disabled'}.`
+        : `⚠️ Could not update auto pipeline.`;
+      await appendMessage('assistant', ack);
+      return fresh(res).status(r.ok ? 200 : 409).json(ok({ text: ack, result: j }));
+    }
+
     if (intentData.intent === 'system_power') {
       const enabled = intentData.action === 'on';
       const state = setSystemEnabled(enabled, 'console:llm');
-      const sideEffect = {
-        systemEnabled: state.enabled,
-        version: state.version,
-        updatedAt: state.updatedAt,
-      };
+      const sideEffect = { systemEnabled: state.enabled, version: state.version, updatedAt: state.updatedAt };
       const ack = state.enabled ? '✅ System enabled (Online).' : '⛔ System disabled (Offline).';
       await appendMessage('assistant', ack);
       return fresh(res).json(ok({ text: ack, sideEffect }));
@@ -378,11 +435,9 @@ app.post('/api/console', async (req, res) => {
     if (intentData.intent === 'toggle_connections') {
       const sideEffect = { toggleConnections: intentData.action };
       const ack =
-        sideEffect.toggleConnections === 'on'
-          ? '👁️ Connections shown.'
-          : sideEffect.toggleConnections === 'off'
-            ? '🙈 Connections hidden.'
-            : '🔁 Connections toggled.';
+        sideEffect.toggleConnections === 'on' ? '👁️ Connections shown.'
+        : sideEffect.toggleConnections === 'off' ? '🙈 Connections hidden.'
+        : '🔁 Connections toggled.';
       await appendMessage('assistant', ack);
       return fresh(res).json(ok({ text: ack, sideEffect }));
     }
@@ -392,15 +447,78 @@ app.post('/api/console', async (req, res) => {
       await appendMessage('assistant', ack);
       return fresh(res).json(ok({ text: ack, sideEffect }));
     }
+    if (intentData.intent === 'policy_query') {
+      const text = formatPolicyQuery(intentData.aspect);
+      await appendMessage('assistant', text);
+      return fresh(res).json(ok({ text }));
+    }
+    if (intentData.intent === 'supervisor_control') {
+      let msg = 'OK';
+      if (intentData.action === 'start') msg = supervisorStart();
+      else if (intentData.action === 'pause') msg = supervisorPause();
+      else if (intentData.action === 'resume') msg = supervisorResume();
+      else if (intentData.action === 'stop') msg = supervisorStop();
 
-    // 3B) System query — authoritative, no LLM text generation needed
+      const sup = supervisorSummary();
+      const ack = `🧠 Supervisor: ${sup.status.toUpperCase()} • runtime ${sup.runtimeSec}s`;
+      await appendMessage('assistant', ack);
+      return fresh(res).json(ok({ text: ack, sideEffect: { supervisor: sup }, message: msg }));
+    }
+    if (intentData.intent === 'supervisor_query' && intentData.aspect === 'status') {
+      const sup = supervisorSummary();
+      const ack = `🧠 Supervisor status: ${sup.status} • runtime ${sup.runtimeSec}s • tasks ${sup.tasksRouted}`;
+      await appendMessage('assistant', ack);
+      return fresh(res).json(ok({ text: ack, supervisor: sup }));
+    }
+
+    // agent control (start/stop)
+    if (intentData.intent === 'agent_control') {
+      const agent = mapAgent(intentData.agent);
+      if (!agent) {
+        const msg = `❓ I couldn't identify the agent ("${intentData.agent}"). Use A/B/C or correlation/troubleshooting/rca.`;
+        await appendMessage('assistant', msg);
+        return fresh(res).status(409).json(ok({ text: msg }));
+      }
+      const op = intentData.action === 'start' ? 'start' : 'stop';
+      const r = await fetch(`http://localhost:8787/api/agents/${agent}/${op}`, { method: 'POST' });
+      const j = await r.json().catch(() => ({}));
+      const ack = r.ok ? `✅ Agent ${agent.toUpperCase()} ${op}ed.` : `⚠️ Could not ${op} agent ${agent.toUpperCase()}.`;
+      await appendMessage('assistant', ack);
+      return fresh(res).status(r.ok ? 200 : 409).json(ok({ text: ack, result: j }));
+    }
+
+    // agent query (status / logs url)
+    if (intentData.intent === 'agent_query') {
+      const agent = mapAgent(intentData.agent);
+      if (!agent) {
+        const msg = `❓ I couldn't identify the agent ("${intentData.agent}"). Use A/B/C or correlation/troubleshooting/rca.`;
+        await appendMessage('assistant', msg);
+        return fresh(res).status(409).json(ok({ text: msg }));
+      }
+      if (intentData.aspect === 'status') {
+        const r = await fetch(`http://localhost:8787/api/agents/${agent}`);
+        const j = await r.json().catch(() => ({}));
+        const status = j?.agent?.status ?? 'unknown';
+        const tasks = j?.agent?.tasks ?? 0;
+        const ack = `🧩 Agent ${agent.toUpperCase()} status: ${status} • tasks ${tasks}`;
+        await appendMessage('assistant', ack);
+        return fresh(res).status(r.ok ? 200 : 409).json(ok({ text: ack, result: j }));
+      }
+      if (intentData.aspect === 'logs_url') {
+        const url = `http://localhost:8787/api/agents/${agent}/logs`;
+        const ack = `📜 Open logs stream: ${url}`;
+        await appendMessage('assistant', ack);
+        return fresh(res).json(ok({ text: ack, url }));
+      }
+    }
+
     if (intentData.intent === 'system_query') {
       const text = formatSystemQuery(intentData.aspect);
       await appendMessage('assistant', text);
       return fresh(res).json(ok({ text }));
     }
 
-    /* 4) No console intent → normal assistant reply (with LIVE snapshot + tools) */
+    // ---------- fallback to LLM tools ----------
     const dashboardEnabledHdr = req.get('X-Dashboard-Enabled');
     const sysLine = buildSystemSnapshotLine(getSystemState(), {
       dashboardEnabled: dashboardEnabledHdr === undefined ? undefined : dashboardEnabledHdr === 'true',
@@ -411,19 +529,16 @@ app.post('/api/console', async (req, res) => {
     const RECENT_K = 20;
     const recent = (mem.messages ?? []).slice(-RECENT_K).map((m) => ({ role: m.role, content: m.content }));
 
-    // Strong steering to use tools for facts & transcript stats
     const sysGuard = [
-      'You are the Command Console Assistant for Launch CTRL.',
-      'If the user asks about system status, uptime, counts (on/off), version, last update, or history, ' +
-        'you MUST call get_system_state and base your answer on its output.',
-      'If the user asks about conversation statistics, greetings, or what they said previously, ' +
-        'you MUST call get_console_messages and compute the answer from that transcript.',
-      'Do not guess numeric values; always use tool output.',
+      CONSOLE_BEHAVIOR_PROMPT,
+      'If the user asks about system status, uptime, counts (on/off), version, last update, or history, you MUST call get_system_state.',
+      'If the user asks about conversation statistics, you MUST call get_console_messages and compute ONLY from USER messages.',
+      'Do not guess numeric values.',
     ].join(' ');
 
     const text = await runLLMWithTools([
       { role: 'system', content: sysGuard },
-      { role: 'system', content: sysLine },              // hint; tool provides truth
+      { role: 'system', content: sysLine },
       { role: 'system', content: memoryPreamble },
       ...(system ? [{ role: 'system', content: system }] : []),
       ...recent,
@@ -438,7 +553,7 @@ app.post('/api/console', async (req, res) => {
   }
 });
 
-// Streaming route (emits [[SIDE_EFFECT]] first for console intents)
+// Streaming console
 app.post('/api/console/stream', async (req, res) => {
   try {
     const { prompt, system } = req.body ?? {};
@@ -447,7 +562,6 @@ app.post('/api/console/stream', async (req, res) => {
       return res.end('Missing "prompt" string');
     }
 
-    // streaming headers
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Transfer-Encoding', 'chunked');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -458,24 +572,67 @@ app.post('/api/console/stream', async (req, res) => {
 
     await appendMessage('user', prompt);
 
-    // 1) Semantic classification
     let intentData = await classifyIntentLLM(prompt);
-
-    // 2) Regex fallback (system power only)
+    if (!intentData || intentData.intent === 'none') {
+      const fbApp = parseApprovalFallback(prompt);
+      if (fbApp) intentData = fbApp;
+    }
     if (!intentData || intentData.intent === 'none') {
       const fb = parseSystemIntent(prompt);
       if (fb.match) intentData = { intent: fb.intent, action: fb.action };
     }
 
-    // 3A) Execute control intents with an immediate side-effect line
+    // approvals (stream)
+    if (intentData.intent === 'approvals') {
+      if (intentData.action === 'list') {
+        const r = await fetch('http://localhost:8787/api/supervisor/approvals');
+        const j = await r.json().catch(() => ({}));
+        const items = Array.isArray(j?.approvals) ? j.approvals : [];
+        const lines = items.length
+          ? items.map(a => `#${a.id} • ${a.siteId} • ${a.status} • ${a.reason || 'n/a'}`).join('\n- ')
+          : 'No pending approvals.';
+        const txt = items.length ? `Pending approvals:\n- ${lines}` : 'No pending approvals.';
+        res.write(txt);
+        await appendMessage('assistant', txt);
+        return res.end();
+      }
+      if (intentData.action === 'approve' && Number.isInteger(intentData.id)) {
+        const r = await fetch(`http://localhost:8787/api/supervisor/approvals/${intentData.id}/approve`, { method: 'POST' });
+        const j = await r.json().catch(() => ({}));
+        const txt = j?.ok ? `✅ Approved #${intentData.id}.` : `⚠️ Could not approve #${intentData.id}.`;
+        res.write(txt);
+        await appendMessage('assistant', txt);
+        return res.end();
+      }
+      if (intentData.action === 'reject' && Number.isInteger(intentData.id)) {
+        const r = await fetch(`http://localhost:8787/api/supervisor/approvals/${intentData.id}/reject`, { method: 'POST' });
+        const j = await r.json().catch(() => ({}));
+        const txt = j?.ok ? `🛑 Rejected #${intentData.id}.` : `⚠️ Could not reject #${intentData.id}.`;
+        res.write(txt);
+        await appendMessage('assistant', txt);
+        return res.end();
+      }
+    }
+
+    // supervisor auto (stream)
+    if (intentData.intent === 'supervisor_auto') {
+      const body = JSON.stringify({ enabled: !!intentData.enabled });
+      const r = await fetch(`http://localhost:8787/api/supervisor/auto`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body
+      });
+      const j = await r.json().catch(() => ({}));
+      res.write(`[[SIDE_EFFECT]]${JSON.stringify({ autoResult: j })}\n`);
+      const ack = r.ok
+        ? `🤖 Auto pipeline ${intentData.enabled ? 'enabled' : 'disabled'}.`
+        : `⚠️ Could not update auto pipeline.`;
+      await appendMessage('assistant', ack);
+      return res.end(ack);
+    }
+
     if (intentData.intent === 'system_power') {
       const enabled = intentData.action === 'on';
       const state = setSystemEnabled(enabled, 'console:stream');
-      const sideEffect = {
-        systemEnabled: state.enabled,
-        version: state.version,
-        updatedAt: state.updatedAt,
-      };
+      const sideEffect = { systemEnabled: state.enabled, version: state.version, updatedAt: state.updatedAt };
       res.write(`[[SIDE_EFFECT]]${JSON.stringify(sideEffect)}\n`);
       const ack = state.enabled ? '✅ System enabled (Online).' : '⛔ System disabled (Offline).';
       res.write(ack);
@@ -486,11 +643,9 @@ app.post('/api/console/stream', async (req, res) => {
       const sideEffect = { toggleConnections: intentData.action };
       res.write(`[[SIDE_EFFECT]]${JSON.stringify(sideEffect)}\n`);
       const ack =
-        sideEffect.toggleConnections === 'on'
-          ? '👁️ Connections shown.'
-          : sideEffect.toggleConnections === 'off'
-            ? '🙈 Connections hidden.'
-            : '🔁 Connections toggled.';
+        sideEffect.toggleConnections === 'on' ? '👁️ Connections shown.'
+        : sideEffect.toggleConnections === 'off' ? '🙈 Connections hidden.'
+        : '🔁 Connections toggled.';
       res.write(ack);
       await appendMessage('assistant', ack);
       return res.end();
@@ -503,8 +658,73 @@ app.post('/api/console/stream', async (req, res) => {
       await appendMessage('assistant', ack);
       return res.end();
     }
+    if (intentData.intent === 'policy_query') {
+      const text = formatPolicyQuery(intentData.aspect);
+      res.write(text);
+      await appendMessage('assistant', text);
+      return res.end();
+    }
+    if (intentData.intent === 'supervisor_control') {
+      if (intentData.action === 'start') supervisorStart();
+      else if (intentData.action === 'pause') supervisorPause();
+      else if (intentData.action === 'resume') supervisorResume();
+      else if (intentData.action === 'stop') supervisorStop();
 
-    // 3B) System query — authoritative one-shot text (fast path)
+      const sup = supervisorSummary();
+      res.write(`[[SIDE_EFFECT]]${JSON.stringify({ supervisor: sup })}\n`);
+      const ack = `🧠 Supervisor: ${sup.status.toUpperCase()} • runtime ${sup.runtimeSec}s`;
+      await appendMessage('assistant', ack);
+      return res.end(ack);
+    }
+    if (intentData.intent === 'supervisor_query' && intentData.aspect === 'status') {
+      const sup = supervisorSummary();
+      const ack = `🧠 Supervisor status: ${sup.status} • runtime ${sup.runtimeSec}s • tasks ${sup.tasksRouted}`;
+      res.write(ack);
+      await appendMessage('assistant', ack);
+      return res.end();
+    }
+
+    // agent control / query (stream)
+    if (intentData.intent === 'agent_control') {
+      const agent = mapAgent(intentData.agent);
+      if (!agent) {
+        const msg = `❓ I couldn't identify the agent ("${intentData.agent}"). Use A/B/C or correlation/troubleshooting/rca.`;
+        await appendMessage('assistant', msg);
+        return res.end(msg);
+      }
+      const op = intentData.action === 'start' ? 'start' : 'stop';
+      const r = await fetch(`http://localhost:8787/api/agents/${agent}/${op}`, { method: 'POST' });
+      const j = await r.json().catch(() => ({}));
+      res.write(`[[SIDE_EFFECT]]${JSON.stringify({ agent: agent.toUpperCase(), op, result: j })}\n`);
+      const ack = r.ok ? `✅ Agent ${agent.toUpperCase()} ${op}ed.` : `⚠️ Could not ${op} agent ${agent.toUpperCase()}.`;
+      await appendMessage('assistant', ack);
+      return res.end(ack);
+    }
+    if (intentData.intent === 'agent_query') {
+      const agent = mapAgent(intentData.agent);
+      if (!agent) {
+        const msg = `❓ I couldn't identify the agent ("${intentData.agent}"). Use A/B/C or correlation/troubleshooting/rca.`;
+        await appendMessage('assistant', msg);
+        return res.end(msg);
+      }
+      if (intentData.aspect === 'status') {
+        const r = await fetch(`http://localhost:8787/api/agents/${agent}`);
+        const j = await r.json().catch(() => ({}));
+        const status = j?.agent?.status ?? 'unknown';
+        const tasks = j?.agent?.tasks ?? 0;
+        const ack = `🧩 Agent ${agent.toUpperCase()} status: ${status} • tasks ${tasks}`;
+        res.write(`[[SIDE_EFFECT]]${JSON.stringify({ agent: agent.toUpperCase(), status, tasks, result: j })}\n`);
+        await appendMessage('assistant', ack);
+        return res.end(ack);
+      }
+      if (intentData.aspect === 'logs_url') {
+        const url = `http://localhost:8787/api/agents/${agent}/logs`;
+        const ack = `📜 Open logs stream: ${url}`;
+        await appendMessage('assistant', ack);
+        return res.end(ack);
+      }
+    }
+
     if (intentData.intent === 'system_query') {
       const text = formatSystemQuery(intentData.aspect);
       res.write(text);
@@ -512,7 +732,7 @@ app.post('/api/console/stream', async (req, res) => {
       return res.end();
     }
 
-    /* 4) No console intent → tool-enabled answer (single chunk write) */
+    // ---------- fallback to LLM tools ----------
     const dashboardEnabledHdr = req.get('X-Dashboard-Enabled');
     const sysLine = buildSystemSnapshotLine(getSystemState(), {
       dashboardEnabled: dashboardEnabledHdr === undefined ? undefined : dashboardEnabledHdr === 'true',
@@ -524,17 +744,15 @@ app.post('/api/console/stream', async (req, res) => {
     const recent = (mem.messages ?? []).slice(-RECENT_K).map((m) => ({ role: m.role, content: m.content }));
 
     const sysGuard = [
-      'You are the Command Console Assistant for Launch CTRL.',
-      'If the user asks about system status, uptime, counts (on/off), version, last update, or history, ' +
-        'you MUST call get_system_state and base your answer on its output.',
-      'If the user asks about conversation statistics, greetings, or what they said previously, ' +
-        'you MUST call get_console_messages and compute the answer from that transcript.',
-      'Do not guess numeric values; always use tool output.',
+      CONSOLE_BEHAVIOR_PROMPT,
+      'If the user asks about system status, uptime, counts (on/off), version, last update, or history, you MUST call get_system_state.',
+      'If the user asks about conversation statistics, you MUST call get_console_messages and compute ONLY from USER messages.',
+      'Do not guess numeric values.',
     ].join(' ');
 
     const text = await runLLMWithTools([
       { role: 'system', content: sysGuard },
-      { role: 'system', content: sysLine },              // hint, but tools give truth
+      { role: 'system', content: sysLine },
       { role: 'system', content: memoryPreamble },
       ...(system ? [{ role: 'system', content: system }] : []),
       ...recent,
@@ -546,9 +764,7 @@ app.post('/api/console/stream', async (req, res) => {
     return res.end();
   } catch (err0) {
     console.error('Stream error:', err0);
-    if (!res.headersSent) {
-      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
-    }
+    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
     try { res.write(`[error] ${err0.message || 'Server error'}`); } catch {}
     return res.end();
   }
@@ -556,8 +772,7 @@ app.post('/api/console/stream', async (req, res) => {
 
 /* =======================================================================================
  * Memory utility routes
- * =======================================================================================
- */
+ * ======================================================================================= */
 app.get('/api/memory/console', async (_req, res) => {
   try {
     const mem = await loadConsoleMemory();
@@ -600,27 +815,24 @@ app.post('/api/memory/console/tag', async (req, res) => {
 
 /* =======================================================================================
  * System power state (REST + SSE)
- * =======================================================================================
- */
+ * ======================================================================================= */
 app.get('/api/system', (_req, res) => {
-  const state = getSystemState(); // { enabled, version, updatedAt, counts, history, uptimeSeconds, ... }
+  const state = getSystemState();
   fresh(res).json(ok(state));
 });
 
 app.post('/api/system', (req, res) => {
   const { enabled } = req.body ?? {};
-  const state = setSystemEnabled(Boolean(enabled), 'rest:post'); // { enabled, version, updatedAt, counts, ... }
+  const state = setSystemEnabled(Boolean(enabled), 'rest:post');
   fresh(res).json(ok(state));
 });
 
-// Live system state via SSE
 app.get('/api/system/stream', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders?.();
 
-  // send current state immediately as a named event ("system") for parity with broadcast()
   const now = getSystemState();
   res.write(`event: system\ndata: ${JSON.stringify(now)}\n\n`);
 
@@ -628,180 +840,7 @@ app.get('/api/system/stream', (req, res) => {
 });
 
 /* =======================================================================================
- * Correlation Agent backend (unchanged)
- * =======================================================================================
- */
-class CorrelationAgent {
-  constructor(name = 'Agent A') {
-    this.name = name;
-    this.status = 'stopped';            // 'idle' | 'running' | 'stopped'
-    this.delegation = 'disabled';       // 'enabled' | 'disabled'
-    this.startedAt = null;              // Date | null
-    this.runtimeSec = 0;                // accumulates across runs
-    this.tasks = 47;                    // seed to match your UI
-    this.lastTask = null;
-    this.logs = [];                     // string[]
-    this.subscribers = new Set();       // SSE clients
-  }
-
-  _log(msg) {
-    const line = `[${new Date().toISOString()}] [${this.name}] ${msg}`;
-    this.logs.push(line);
-    if (this.logs.length > 2000) this.logs.shift();
-    for (const res of this.subscribers) {
-      try { res.write(`data: ${line}\n\n`); } catch {}
-    }
-  }
-
-  get summary() {
-    const live = this.startedAt ? Math.floor((Date.now() - this.startedAt.getTime()) / 1000) : 0;
-    return {
-      name: this.name,
-      status: this.status === 'running' ? 'Active' : (this.status === 'stopped' ? 'Stopped' : 'Idle'),
-      delegation: this.delegation === 'enabled' ? 'Enabled' : 'Disabled',
-      runtimeSec: this.runtimeSec + live,
-      tasks: this.tasks,
-      lastTask: this.lastTask,
-    };
-  }
-
-  start() {
-    if (this.status === 'running') return 'Already running';
-    this.status = 'running';
-    this.startedAt = new Date();
-    this._log('started');
-    return 'OK: started';
-  }
-
-  stop() {
-    if (this.status !== 'running') {
-      this.status = 'stopped';
-      this._log('stopped (no-op)');
-      return 'OK: stopped';
-    }
-    const delta = Math.floor((Date.now() - this.startedAt.getTime()) / 1000);
-    this.runtimeSec += delta;
-    this.startedAt = null;
-    this.status = 'stopped';
-    this._log(`stopped (accumulated ${delta}s)`);
-    return 'OK: stopped';
-  }
-
-  setDelegation(enabled) {
-    this.delegation = enabled ? 'enabled' : 'disabled';
-    this._log(`delegation ${this.delegation}`);
-    return `OK: delegation ${this.delegation}`;
-  }
-
-  // Deterministic correlation baseline (5-min window by siteId)
-  correlate(events = []) {
-    const bySite = new Map();
-    for (const e of events) {
-      const key = e.siteId ?? 'unknown';
-      if (!bySite.has(key)) bySite.set(key, []);
-      bySite.get(key).push(e);
-    }
-    const incidents = [];
-    for (const [site, list] of bySite.entries()) {
-      list.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-      let cur = { siteId: site, start: null, end: null, count: 0, types: new Set(), events: [] };
-      const PUSH = () => {
-        incidents.push({
-          siteId: cur.siteId,
-          start: cur.start,
-          end: cur.end,
-          count: cur.count,
-          types: [...cur.types],
-          events: cur.events,
-        });
-      };
-      const WINDOW_MS = 5 * 60 * 1000; // 5 minutes
-      for (const ev of list) {
-        const t = new Date(ev.timestamp).getTime();
-        if (!cur.start) {
-          cur.start = ev.timestamp;
-          cur.end = ev.timestamp;
-          cur.count = 1;
-          cur.types.add(ev.type);
-          cur.events.push(ev);
-          continue;
-        }
-        const last = new Date(cur.end).getTime();
-        if (t - last <= WINDOW_MS) {
-          cur.end = ev.timestamp;
-          cur.count++;
-          cur.types.add(ev.type);
-          cur.events.push(ev);
-        } else {
-          PUSH();
-          cur = { siteId: site, start: ev.timestamp, end: ev.timestamp, count: 1, types: new Set([ev.type]), events: [ev] };
-        }
-      }
-      if (cur.count > 0) PUSH();
-    }
-
-    this.lastTask = `correlated ${events.length} events → ${incidents.length} incidents`;
-    this.tasks += 1;
-    this._log(this.lastTask);
-    return { incidents };
-  }
-}
-
-const correlationAgent = new CorrelationAgent('Agent A');
-
-// --- Correlation Agent routes ---
-app.get('/api/agents/correlation', (_req, res) => {
-  return fresh(res).json(ok({ agent: correlationAgent.summary }));
-});
-
-app.post('/api/agents/correlation/start', (_req, res) => {
-  const out = correlationAgent.start();
-  return fresh(res).json(ok({ message: out, agent: correlationAgent.summary }));
-});
-
-app.post('/api/agents/correlation/stop', (_req, res) => {
-  const out = correlationAgent.stop();
-  return fresh(res).json(ok({ message: out, agent: correlationAgent.summary }));
-});
-
-app.post('/api/agents/correlation/delegation', (req, res) => {
-  const { enabled } = req.body ?? {};
-  const out = correlationAgent.setDelegation(Boolean(enabled));
-  return fresh(res).json(ok({ message: out, agent: correlationAgent.summary }));
-});
-
-app.post('/api/agents/correlation/correlate', (req, res) => {
-  const { events } = req.body ?? {};
-  if (!Array.isArray(events)) {
-    return fresh(res).status(400).json(err('Body must include array "events"'));
-  }
-  if (correlationAgent.status !== 'running') {
-    return fresh(res).status(409).json(err('Agent not running'));
-  }
-  const result = correlationAgent.correlate(events);
-  return fresh(res).json(ok({ result, agent: correlationAgent.summary }));
-});
-
-app.get('/api/agents/correlation/logs', (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-cache, no-transform');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders?.();
-
-  res.write(`data: [connected ${new Date().toISOString()}]\n\n`);
-  const recent = correlationAgent.logs.slice(-20);
-  for (const line of recent) res.write(`data: ${line}\n\n`);
-
-  correlationAgent.subscribers.add(res);
-  req.on('close', () => {
-    correlationAgent.subscribers.delete(res);
-    try { res.end(); } catch {}
-  });
-});
-
-/* =======================================================================================
  * Server boot
- * =======================================================================================
- */
+ * ======================================================================================= */
 const PORT = process.env.PORT || 8787;
 app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
