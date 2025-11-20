@@ -4,6 +4,7 @@
 import { getPolicy } from '../policy/store.js';
 import { getState, power, rru } from '../tower/client.js';
 import { supervisorNote } from '../tools/supervisorNote.js';
+import { incidentBus } from '../bus/incidentBus.js'; // <-- emit terminal signals
 
 const MAX_SWEEPS = 3;
 const MAX_RRU_ATTEMPTS = 3;
@@ -42,6 +43,20 @@ export class TroubleshootingAgent {
       tasks: this.tasks,
       lastTask: this.lastTask,
     };
+  }
+
+  // Some routes prefer a method; mirror summary for convenience
+  snapshot() {
+    return this.summary;
+  }
+
+  // SSE logs subscription helper
+  subscribeLogs(res) {
+    this.subscribers.add(res);
+    res.on('close', () => {
+      this.subscribers.delete(res);
+      try { res.end(); } catch {}
+    });
   }
 
   start() {
@@ -180,8 +195,8 @@ export class TroubleshootingAgent {
       this._log(`RRU RESET step (ON) ${siteId} ${antenna} (attempt ${attempt})`);
       await this._sleep(RECHECK_MS);
 
-      s = await this._fetchSite(siteId);
-      const svc2 = antenna === 'a1' ? s?.antenna1?.service : s?.antenna2?.service;
+      const s2 = await this._fetchSite(siteId);
+      const svc2 = antenna === 'a1' ? s2?.antenna1?.service : s2?.antenna2?.service;
       if (svc2 === 'Available') return { ok: true };
     }
     this._log(`RRU HEAL failed ${siteId} ${antenna} after ${MAX_RRU_ATTEMPTS} attempt(s)`);
@@ -279,8 +294,23 @@ export class TroubleshootingAgent {
 
     if (allClear) {
       supervisorNote(`Troubleshooting: ${siteId} restored and alarms cleared (${clearedAlarms.length} cleared).`);
+      // ---- Terminal signal (resolved) → Supervisor will quiesce B & C
+      incidentBus.emit('incident.resolved', {
+        siteId,
+        incidentId: `${siteId}-${Date.now()}`,
+        ts: Date.now(),
+        by: 'AgentB',
+      });
     } else {
       supervisorNote(`Troubleshooting: ${siteId} stabilized; remaining alarms=${finalAlarms.map(a => a.code).join(', ') || 'none'}.`);
+      // ---- Terminal-enough signal (stabilized) → Supervisor will quiesce B & C
+      incidentBus.emit('incident.stabilized', {
+        siteId,
+        incidentId: `${siteId}-${Date.now()}`,
+        remaining: finalAlarms.map(a => a.code),
+        ts: Date.now(),
+        by: 'AgentB',
+      });
     }
 
     return {

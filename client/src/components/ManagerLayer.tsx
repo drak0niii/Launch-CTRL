@@ -1,15 +1,136 @@
-import { Brain, ArrowDownUp, Activity, Gauge, AlertTriangle, CheckCircle2 } from "lucide-react";
+import {
+  Brain,
+  ArrowDownUp,
+  Activity,
+  BatteryFull,
+  Gauge,
+} from "lucide-react";
 import { motion } from "motion/react";
-import { forwardRef, RefObject } from "react";
+import React, { forwardRef, RefObject, useEffect, useState } from "react";
 
 export interface ManagerLayerProps {
   position: { x: number; y: number };
   onDrag: (e: any, info: any) => void;
-dragConstraints?: RefObject<HTMLElement | null>;
+  dragConstraints?: RefObject<HTMLElement | null>;
 }
+
+// Simulator site IDs (3 nodes)
+const SITE_IDS = ["NYNYNJ0836", "NYNYNJ0837", "TX0482"] as const;
+type SiteId = (typeof SITE_IDS)[number];
+
+type SiteMetrics = {
+  battery: number | null;
+  prevBattery: number | null;
+  mains: "on" | "off" | null;
+};
+
+type MetricsMap = Record<SiteId, SiteMetrics>;
 
 export const ManagerLayer = forwardRef<HTMLDivElement, ManagerLayerProps>(
   ({ position, onDrag, dragConstraints }, ref) => {
+    // --- Battery + mains state for the 3 nodes ---
+    const [metrics, setMetrics] = useState<MetricsMap>({
+      NYNYNJ0836: { battery: null, prevBattery: null, mains: null },
+      NYNYNJ0837: { battery: null, prevBattery: null, mains: null },
+      TX0482: { battery: null, prevBattery: null, mains: null },
+    });
+
+    useEffect(() => {
+      // Subscribe to tower bridge SSE
+      const es = new EventSource("/api/tower/stream");
+
+      es.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+
+          // We support both shapes:
+          // { event: 'tower.http.state', payload: { state: { sites: {...} } } }
+          // or direct { state: { sites: {...} } } or { sites: {...} }
+          const payload = data?.payload ?? data;
+          const state = payload?.state ?? payload;
+          const sites = state?.sites ?? {};
+
+          setMetrics((prev) => {
+            const next: MetricsMap = { ...prev };
+            SITE_IDS.forEach((id) => {
+              const site = sites?.[id];
+              if (!site) return;
+
+              const rawBatt = site.batteryPercent;
+              const mains = site.mains as "on" | "off" | undefined;
+
+              if (typeof rawBatt === "number" && !Number.isNaN(rawBatt)) {
+                const current = prev[id] ?? {
+                  battery: null,
+                  prevBattery: null,
+                  mains: null,
+                };
+                next[id] = {
+                  battery: rawBatt,
+                  prevBattery: current.battery,
+                  mains: mains ?? current.mains ?? null,
+                };
+              } else if (mains) {
+                // update mains even if battery not present in this tick
+                const current = prev[id] ?? {
+                  battery: null,
+                  prevBattery: null,
+                  mains: null,
+                };
+                next[id] = {
+                  ...current,
+                  mains,
+                };
+              }
+            });
+            return next;
+          });
+        } catch {
+          // Ignore malformed lines; SSE stream may also send heartbeats
+        }
+      };
+
+      es.onerror = () => {
+        // keep the connection; errors are common with SSE during idle/refresh
+      };
+
+      return () => {
+        es.close();
+      };
+    }, []);
+
+    // Helpers
+    const fmtBattery = (val: number | null) =>
+      typeof val === "number" ? `${Math.round(val)}%` : "--%";
+
+    const getBatteryColor = (val: number | null) => {
+      if (val == null || Number.isNaN(val)) return "text-cyan-300";
+      const rounded = Math.round(val);
+      if (rounded <= 0) return "text-red-400"; // 0% → red
+      if (rounded === 100) return "text-emerald-400"; // 100% → green
+      return "text-amber-400"; // 1–99% → orange
+    };
+
+    const renderBatteryCard = (siteId: SiteId) => {
+      const m = metrics[siteId];
+      const iconClass = getBatteryColor(m.battery);
+
+      return (
+        <div
+          key={siteId}
+          className="bg-black/30 rounded-lg px-2 py-1.5 text-center border border-cyan-400/20"
+        >
+          <BatteryFull className={`w-4 h-4 mx-auto mb-1 ${iconClass}`} />
+          <p className="text-cyan-100 text-xs opacity-80 leading-tight">
+            Battery
+          </p>
+          <p className="text-cyan-50 text-sm font-semibold leading-tight">
+            {fmtBattery(m.battery)}
+          </p>
+        </div>
+      );
+    };
+
     return (
       <motion.div
         drag
@@ -45,10 +166,11 @@ export const ManagerLayer = forwardRef<HTMLDivElement, ManagerLayerProps>(
             {/* Goal & Policy */}
             <div className="bg-black/20 rounded-lg p-3 border border-cyan-400/20 mb-3">
               <p className="text-cyan-100 text-sm mb-1">
-                <strong className="text-cyan-300">Goal:</strong> Restore site power or dispatch FLM
+                <strong className="text-cyan-300">Goal:</strong> Restore site
+                power or dispatch FLM
               </p>
               <p className="text-cyan-100 text-xs opacity-80">
-                Policy: Critical First • Human-in-the-Loop • SLA {'>'}95%
+                Policy: Critical First • Human-in-the-Loop • SLA {" >"}95%
               </p>
             </div>
 
@@ -56,11 +178,16 @@ export const ManagerLayer = forwardRef<HTMLDivElement, ManagerLayerProps>(
             <div className="bg-black/20 rounded-lg p-3 border border-cyan-400/20 mb-3">
               <div className="flex items-center gap-2 mb-1">
                 <Activity className="w-4 h-4 text-cyan-300" />
-                <span className="text-cyan-100 text-sm font-medium">Active Playbook</span>
+                <span className="text-cyan-100 text-sm font-medium">
+                  Active Playbook
+                </span>
               </div>
-              <p className="text-cyan-100 text-xs opacity-80 ml-6">Power Mains Failure v2.3</p>
+              <p className="text-cyan-100 text-xs opacity-80 ml-6">
+                Power Mains Failure v2.3
+              </p>
               <p className="text-cyan-100 text-xs ml-6 opacity-70">
-                Steps: Detect → Validate Grid → Check On-Site → Dispatch FLM → Monitor → Close
+                Steps: Detect → Validate Grid → Check On-Site → Dispatch FLM →
+                Monitor → Close
               </p>
             </div>
 
@@ -72,30 +199,36 @@ export const ManagerLayer = forwardRef<HTMLDivElement, ManagerLayerProps>(
                   <span className="text-cyan-100 text-sm">Task Coordination</span>
                 </div>
                 <div className="px-4 py-2 text-xs text-cyan-100 space-y-1">
-                  <p>• <strong>Agent A:</strong> Check power company outage — ✅ Done</p>
-                  <p>• <strong>Agent B:</strong> Monitor outage resolution — 🔄 Running</p>
-                  <p>• <strong>Agent C:</strong> Standby for dispatch — ⏸ Idle</p>
+                  <p>
+                    • <strong>Agent A:</strong> Check power company outage — ✅
+                    Done
+                  </p>
+                  <p>
+                    • <strong>Agent B:</strong> Monitor outage resolution — 🔄
+                    Running
+                  </p>
+                  <p>
+                    • <strong>Agent C:</strong> Standby for dispatch — ⏸ Idle
+                  </p>
                 </div>
               </div>
             </div>
 
-            {/* Metrics */}
-            <div className="grid grid-cols-3 gap-2 mt-4">
-              <div className="bg-black/30 rounded-lg p-2 text-center border border-cyan-400/20">
+            {/* Metrics → Progress + 3 thinner Battery blocks (4 in a row) */}
+            <div className="grid grid-cols-4 gap-2 mt-4">
+              {/* Progress box (left) */}
+              <div className="bg-black/30 rounded-lg px-2 py-1.5 text-center border border-cyan-400/20">
                 <Gauge className="w-4 h-4 text-cyan-300 mx-auto mb-1" />
-                <p className="text-cyan-100 text-xs">Progress</p>
-                <p className="text-cyan-50 text-sm font-semibold">60%</p>
+                <p className="text-cyan-100 text-xs opacity-80 leading-tight">
+                  Progress
+                </p>
+                <p className="text-cyan-50 text-sm font-semibold leading-tight">
+                  60%
+                </p>
               </div>
-              <div className="bg-black/30 rounded-lg p-2 text-center border border-cyan-400/20">
-                <AlertTriangle className="w-4 h-4 text-amber-400 mx-auto mb-1" />
-                <p className="text-cyan-100 text-xs">Battery</p>
-                <p className="text-cyan-50 text-sm font-semibold">42%</p>
-              </div>
-              <div className="bg-black/30 rounded-lg p-2 text-center border border-cyan-400/20">
-                <CheckCircle2 className="w-4 h-4 text-emerald-400 mx-auto mb-1" />
-                <p className="text-cyan-100 text-xs">SLA</p>
-                <p className="text-cyan-50 text-sm font-semibold">On Track</p>
-              </div>
+
+              {/* 3 battery boxes */}
+              {SITE_IDS.map(renderBatteryCard)}
             </div>
           </div>
 

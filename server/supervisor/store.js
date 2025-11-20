@@ -3,14 +3,13 @@
 
 import { EventEmitter } from 'events';
 import { getPolicy, onChange as onPolicyChange } from '../policy/store.js';
-import { incidentBus } from '../bus/incidentBus.js';
+import { incidentBus, onIncident } from '../bus/incidentBus.js';
 import { getTowerSnapshot } from '../tower/bridge.js'; // ← cold-start sweep source
 // avoid circulars: lazy-import agents only when needed
-import { getAutoStatus as _getAutoStatus } from './pipeline.js';
+import { getAutoStatus as _getAutoStatus, quiesceDownstreamAgents } from './pipeline.js';
 
 const logSubscribers = new Set();     // SSE clients for logs
 const bus = new EventEmitter();       // event bus for snapshot stream
-const onIncident = (cb) => incidentBus.on('bus.event', cb); // ✅ only normalized events
 
 // ---- Alarm/Service visibility tap (one-time, logs only — no routing) ----
 let _alarmTapWired = false;
@@ -121,10 +120,12 @@ async function lazyAgentA() {
   return mod.correlationAgent;
 }
 async function lazyAgentB() {
+  // keep your file names; adjust if your actual file is troubleshootingAgent.js
   const mod = await import('../agents/troubleshooting.js');
   return mod.troubleshootingAgent;
 }
 async function lazyAgentC() {
+  // keep your file names; adjust if your actual file is rcaAgent.js
   const mod = await import('../agents/rca.js');
   return mod.rcaAgent;
 }
@@ -190,6 +191,8 @@ function stop() {
   supervisor.startedAt = null;
   supervisor.status = 'stopped';
   ensureAgentsStopped();           // ← Supervisor stops agents
+  // Also ensure downstream agents are quiesced (idempotent)
+  quiesceDownstreamAgents?.('supervisor.stopped');
   _log('stopped');
   broadcast();
   return 'OK: stopped';
@@ -388,6 +391,8 @@ async function handleEvent(evt) {
             resolution: 'restored',
           });
           _log(`Agent C: restored recorded for ${siteId}`);
+          // Terminal → quiesce B & C
+          await quiesceDownstreamAgents?.('auto:restored');
         } else {
           await agentC.recordIncident({
             siteId,
@@ -396,6 +401,8 @@ async function handleEvent(evt) {
             resolution: 'stabilized',
           });
           _log(`Agent C: stabilized/dispatch-suggested recorded for ${siteId}`);
+          // Terminal enough for our pipeline → quiesce B & C
+          await quiesceDownstreamAgents?.('auto:stabilized');
         }
       } catch (e) {
         _log(`Agent C record (post-B) error: ${String(e?.message || e)}`);
@@ -417,6 +424,23 @@ onIncident(async (evt) => {
     _log(`handleEvent fatal: ${String(e?.message || e)}`);
     broadcast();
   }
+});
+
+// ---- Listen for explicit terminal signals from elsewhere and quiesce B & C
+incidentBus.on('incident.resolved', async (evt) => {
+  _log(`terminal.signal → incident.resolved for ${evt?.siteId || 'unknown'}`);
+  await quiesceDownstreamAgents?.('incident.resolved');
+  broadcast();
+});
+incidentBus.on('incident.stabilized', async (evt) => {
+  _log(`terminal.signal → incident.stabilized for ${evt?.siteId || 'unknown'}`);
+  await quiesceDownstreamAgents?.('incident.stabilized');
+  broadcast();
+});
+incidentBus.on('dispatch.issued', async (evt) => {
+  _log(`terminal.signal → dispatch.issued for ${evt?.siteId || 'unknown'}`);
+  await quiesceDownstreamAgents?.('dispatch.issued');
+  broadcast();
 });
 
 // ---------- exports ----------

@@ -1,4 +1,6 @@
 import { useCorrelationAgent } from '../hooks/useCorrelationAgent';
+import { useTroubleshootingAgent } from '../hooks/useTroubleshootingAgent';
+import { useRcaAgent } from '../hooks/useRcaAgent';
 import { Bot, CheckCircle, XCircle, Clock, ListChecks } from "lucide-react";
 import { motion } from "motion/react";
 import { forwardRef, RefObject } from "react";
@@ -6,44 +8,46 @@ import { forwardRef, RefObject } from "react";
 interface AgentNodeProps {
   id: string;
   label: string;
-  isDelegating: boolean; // for B/C; Agent A will override to Disabled
+  isDelegating: boolean; // for B/C; Agent A reads delegation from backend
   position: { x: number; y: number };
   onDrag: (e: any, info: any) => void;
-dragConstraints?: RefObject<Element | null>;
+  dragConstraints?: RefObject<Element | null>;
 }
 
 export const AgentNode = forwardRef<HTMLDivElement, AgentNodeProps>(
   ({ id, label, isDelegating, position, onDrag, dragConstraints }, ref) => {
-    // We always call the hook (can’t be conditional), but we’ll only use it for Agent A.
-    const { agent, loading } = useCorrelationAgent(1500);
     const isAgentA = id === 'agent-a';
+    const isAgentB = id === 'agent-b';
+    const isAgentC = id === 'agent-c';
 
-    // --- Effective state mapping ---
-    // Delegation: for Agent A it's ALWAYS Disabled; for others use prop.
-    const delegationEnabled = isAgentA ? false : isDelegating;
+    // --- Fetch live snapshots for each agent (polling in hooks) ---
+    const { agent: aData, loading: aLoading } = useCorrelationAgent(1500);
+    const { agent: bData, loading: bLoading } = useTroubleshootingAgent(1500);
+    const { agent: cData, loading: cLoading } = useRcaAgent(1500);
 
-    // Status label:
-    //  - Agent A: use backend (Active | Stopped | Idle). Default to Stopped when unknown.
-    //  - Others: keep prior mapping (Active when delegating, Constrained otherwise).
-    const statusLabel = isAgentA
-      ? (agent?.status ?? (loading ? 'Loading…' : 'Stopped'))
-      : (isDelegating ? 'Active' : 'Constrained');
+    // Select the current agent data based on node id
+    const current = isAgentA ? aData : isAgentB ? bData : cData;
+    const loading = isAgentA ? aLoading : isAgentB ? bLoading : cLoading;
 
-    // Is the node visually "active" (drives colors)?
-    const isActive = isAgentA
-      ? agent?.status === 'Active'
-      : isDelegating;
+    // Delegation indicator:
+    //  - Agent A: read from backend (if available)
+    //  - B/C: keep using the prop to reflect supervisor delegation in UI
+    const delegationEnabled =
+      isAgentA ? (aData?.delegation === 'Enabled') : isDelegating;
 
-    // Runtime & Tasks:
-    const runtimeLabel = isAgentA
-      ? `${((agent?.runtimeSec ?? 0)).toFixed(1)}s`
-      : (isDelegating ? "2.3s" : "5.7s");
+    // Status label straight from backend; default sensible values
+    const statusLabel = loading
+      ? 'Loading…'
+      : (current?.status ?? 'Stopped');
 
-    const tasksLabel = isAgentA
-      ? String(agent?.tasks ?? 0)
-      : (isDelegating ? 47 : 12);
+    // Visually active (drives colors/gray state)
+    const isActive = (current?.status === 'Active');
 
-    // Colors (driven by active vs not)
+    // Metrics from backend
+    const runtimeLabel = `${(current?.runtimeSec ?? 0).toFixed(1)}s`;
+    const tasksLabel = String(current?.tasks ?? 0);
+
+    // Colors
     const statusColor = isActive ? "from-green-500 to-emerald-500" : "from-gray-500 to-slate-500";
     const borderColor = isActive ? "border-green-400/50" : "border-gray-400/50";
     const glowColor = isActive ? "bg-green-500/20" : "bg-gray-500/20";
@@ -89,11 +93,7 @@ export const AgentNode = forwardRef<HTMLDivElement, AgentNodeProps>(
               {/* Task Status */}
               <div className="flex items-center justify-between text-sm">
                 <span className="text-gray-400">Task Status</span>
-                <span className={
-                  isAgentA
-                    ? (isActive ? "text-green-300" : "text-gray-300")
-                    : (isDelegating ? "text-green-300" : "text-gray-300")
-                }>
+                <span className={isActive ? "text-green-300" : "text-gray-300"}>
                   {statusLabel}
                 </span>
               </div>
@@ -115,7 +115,7 @@ export const AgentNode = forwardRef<HTMLDivElement, AgentNodeProps>(
                     <span className="text-white text-xs">{runtimeLabel}</span>
                   </div>
                 </div>
-                
+
                 <div className="flex items-center gap-2 bg-black/30 rounded-lg p-2 border border-gray-600/20">
                   <ListChecks className="w-4 h-4 text-purple-300" />
                   <div className="flex-1 flex items-center justify-between">

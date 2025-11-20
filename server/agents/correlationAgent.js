@@ -21,7 +21,7 @@ export class CorrelationAgent {
     this.windowMs = 5 * 60 * 1000;     // merge window (5m)
 
     // stats
-    this.tasks = 47;                   // seed to match your UI
+    this.tasks = 0;                   // 1) ✅ start at zero
     this.lastTask = null;
 
     // state
@@ -93,6 +93,9 @@ export class CorrelationAgent {
     if (this.status !== 'running') {
       this.status = 'stopped';
       this._log('stopped (no-op)');
+      // 3) ✅ ensure counter is reset even on no-op stop
+      this.tasks = 0;
+      this.lastTask = null;
       return 'OK: stopped';
     }
     const delta = Math.floor((Date.now() - this.startedAt.getTime()) / 1000);
@@ -105,7 +108,11 @@ export class CorrelationAgent {
       this._busUnsub = null;
     }
 
-    this._log(`stopped (accumulated ${delta}s)`);
+    // 3) ✅ reset counter on stop
+    this.tasks = 0;
+    this.lastTask = null;
+
+    this._log(`stopped (accumulated ${delta}s, tasks reset to 0)`);
     return 'OK: stopped';
   }
 
@@ -145,7 +152,7 @@ export class CorrelationAgent {
     if (isState) {
       const siteSnap = evt?.state?.sites?.[siteId];
       if (siteSnap && siteSnap.siteAlive && siteSnap.mains === 'on') {
-        this._closeOpenIncident(siteId, 'service_restored');
+        this._closeOpenIncident(siteId, 'service_restored'); // 2) ✅ counts on close
       }
       return;
     }
@@ -169,13 +176,13 @@ export class CorrelationAgent {
 
     if (!s.open) {
       s.open = this._newIncident(siteId, evt);
-      this._notifyStart(s.open);
+      this._notifyStart(s.open);           // 🔄 no tasks increment here
     } else if (withinWindow) {
       this._extend(s.open, evt);
     } else {
-      this._closeOpenIncident(siteId, 'window_elapsed');
+      this._closeOpenIncident(siteId, 'window_elapsed'); // 2) ✅ counts on close
       s.open = this._newIncident(siteId, evt);
-      this._notifyStart(s.open);
+      this._notifyStart(s.open);           // 🔄 no tasks increment here
     }
 
     // If the alarm cleared and no critical remains, close early
@@ -184,7 +191,7 @@ export class CorrelationAgent {
         ? [...s.open.types].some(isCriticalAlarm)
         : false;
       if (!hasCritical) {
-        this._closeOpenIncident(siteId, 'alarm_cleared');
+        this._closeOpenIncident(siteId, 'alarm_cleared'); // 2) ✅ counts on close
       }
     }
   }
@@ -232,7 +239,7 @@ export class CorrelationAgent {
     s.closed.push(out);
 
     this.lastTask = `incident.closed ${siteId} (${reason}) with ${out.count} events`;
-    this.tasks += 1;
+    this.tasks += 1;                              // 2) ✅ exactly one task per closed incident
     this._log(this.lastTask);
 
     // Inform Supervisor (fire-and-forget)
@@ -243,8 +250,8 @@ export class CorrelationAgent {
   }
 
   _notifyStart(inc) {
+    // 🔄 Do NOT increment tasks on start — only log
     this.lastTask = `incident.started ${inc.siteId} (alarms=${[...inc.types].join(', ')})`;
-    this.tasks += 1;
     this._log(this.lastTask);
 
     // Inform Supervisor (fire-and-forget)
@@ -313,8 +320,9 @@ export class CorrelationAgent {
       PUSH();
     }
 
+    // 2) ✅ increment by the exact number of incidents produced
     this.lastTask = `correlated ${filtered.length} events → ${incidents.length} incidents`;
-    this.tasks += 1;
+    this.tasks += incidents.length;
     this._log(this.lastTask);
     return { incidents };
   }

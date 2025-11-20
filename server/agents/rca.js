@@ -3,6 +3,7 @@
 
 import { getState } from '../tower/client.js';
 import { supervisorNote } from '../tools/supervisorNote.js';
+import { incidentBus } from '../bus/incidentBus.js'; // <-- emit terminal signals
 
 const NOISE_CAUSES = new Set(['unknown', 'heartbeat', 'noop']); // compare lowercased
 const DEDUP_WINDOW_MS = 10_000; // suppress repeats per site/cause/resolution for 10s
@@ -17,7 +18,7 @@ export class RcaAgent {
     this.lastTask = null;
     this.logs = [];
     this.subscribers = new Set();
-    this.casebook = []; // { ts, siteId, cause, actions[], resolution, dispatchSuggested, ongoing, summary }
+    this.casebook = []; // { ts, siteId, cause, actions[], resolution, dispatchSuggested, ongoing, summary, workOrderId?, dispatchedAt? }
     this._lastBySite = new Map(); // siteId -> { cause, resolution, ts }
 
     this._log('initialized (stopped)');
@@ -41,6 +42,11 @@ export class RcaAgent {
       tasks: this.tasks,
       lastTask: this.lastTask,
     };
+  }
+
+  // Routes expect a method sometimes; mirror summary for convenience
+  snapshot() {
+    return this.summary;
   }
 
   subscribeLogs(res) {
@@ -153,17 +159,63 @@ export class RcaAgent {
       summary: this._buildSummaryLine({ siteId, cause, resolution }, site, alarms),
     };
 
-    // Supervisor notes via safe adapter (no circular import)
+    // Supervisor note + terminal signals
     if (item.dispatchSuggested) {
       supervisorNote(`RCA: Dispatch suggested for ${siteId} (${item.summary})`);
+      // Not terminal yet, but stabilize signal quiesces per policy
+      incidentBus.emit('incident.stabilized', {
+        siteId,
+        incidentId: `${siteId}-${Date.now()}`,
+        remaining: alarms,
+        ts: Date.now(),
+        by: 'AgentC',
+      });
     } else {
       supervisorNote(`RCA: ${siteId} resolved — ${item.summary}`);
+      incidentBus.emit('incident.resolved', {
+        siteId,
+        incidentId: `${siteId}-${Date.now()}`,
+        ts: Date.now(),
+        by: 'AgentC',
+      });
     }
 
     this.casebook.push(item);
     this.tasks += 1;
-    this.lastTask = `RCA recorded ${siteId} (resolution=${resolution}, dispatch=${item.dispatchSuggested})`;
+    this.lastTask = `RCA recorded ${siteId} (resolution=${resolution}, dispatchSuggested=${item.dispatchSuggested})`;
     this._log(this.lastTask);
+
+    return { ok: true, case: item };
+  }
+
+  /**
+   * Mark the latest unresolved case for a site as "dispatched"/issued and emit a terminal signal.
+   * If none is pending, returns { ok:false }.
+   */
+  issueDispatch(siteId, workOrderId = `WO-${siteId}-${Date.now()}`) {
+    const idx = this.casebook.slice().reverse().findIndex(
+      c => c.siteId === siteId && !this._isNoise(c) && c.dispatchSuggested && !c.dispatchedAt
+    );
+    if (idx === -1) {
+      return { ok: false, error: 'no_pending_dispatch' };
+    }
+    const realIndex = this.casebook.length - 1 - idx;
+    const item = this.casebook[realIndex];
+    item.dispatchedAt = new Date().toISOString();
+    item.workOrderId = workOrderId;
+    item.dispatchSuggested = false; // no longer "suggested" — it's issued
+
+    supervisorNote(`RCA: Dispatch ISSUED for ${siteId} (WO=${workOrderId}) — ${item.summary}`);
+    this._log(`dispatch.issued ${siteId} (WO=${workOrderId})`);
+
+    // Terminal → supervisor should quiesce B & C
+    incidentBus.emit('dispatch.issued', {
+      siteId,
+      incidentId: `${siteId}-${Date.now()}`,
+      workOrderId,
+      ts: Date.now(),
+      by: 'AgentC',
+    });
 
     return { ok: true, case: item };
   }
@@ -195,6 +247,8 @@ export class RcaAgent {
       ongoing: c.ongoing,
       dispatchSuggested: c.dispatchSuggested,
       summary: c.summary,
+      workOrderId: c.workOrderId || null,
+      dispatchedAt: c.dispatchedAt || null,
     }));
 
     const dispatchQueue = recent.filter(c => c.dispatchSuggested);
