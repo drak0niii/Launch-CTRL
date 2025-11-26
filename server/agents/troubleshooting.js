@@ -4,18 +4,23 @@
 import { getPolicy } from '../policy/store.js';
 import { getState, power, rru } from '../tower/client.js';
 import { supervisorNote } from '../tools/supervisorNote.js';
-import { incidentBus } from '../bus/incidentBus.js'; // <-- emit terminal signals
+import { incidentBus } from '../bus/incidentBus.js';
+import { broadcastNarration } from '../narrator/registry.js';   // ⬅️ NEW
 
 const MAX_SWEEPS = 3;
 const MAX_RRU_ATTEMPTS = 3;
 const RECHECK_MS = 1200;
 const BOOT_SETTLE_MS = 2500;
 const BETWEEN_ACTION_MS = 500;
+const HEAL_FAIL_SUPPRESS_MS = 60_000;
+
+// cache to suppress repeated failure narrations per site/antenna
+const healFailureSeen = new Map(); // key -> timestamp
 
 export class TroubleshootingAgent {
   constructor(name = 'Agent B') {
     this.name = name;
-    this.status = 'stopped';      // 'idle' | 'running' | 'stopped'
+    this.status = 'stopped';
     this.startedAt = null;
     this.runtimeSec = 0;
     this.tasks = 0;
@@ -45,12 +50,8 @@ export class TroubleshootingAgent {
     };
   }
 
-  // Some routes prefer a method; mirror summary for convenience
-  snapshot() {
-    return this.summary;
-  }
+  snapshot() { return this.summary; }
 
-  // SSE logs subscription helper
   subscribeLogs(res) {
     this.subscribers.add(res);
     res.on('close', () => {
@@ -64,6 +65,10 @@ export class TroubleshootingAgent {
     this.status = 'running';
     this.startedAt = new Date();
     this._log('started');
+
+    // === narration (friendly)
+    broadcastNarration("Agent B is now online and ready to troubleshoot the active incident.");
+
     return 'OK: started';
   }
 
@@ -71,6 +76,7 @@ export class TroubleshootingAgent {
     if (this.status !== 'running') {
       this.status = 'stopped';
       this._log('stopped (no-op)');
+      broadcastNarration("Agent B is now in standby."); // mild narration
       return 'OK: stopped';
     }
     const delta = Math.floor((Date.now() - this.startedAt.getTime()) / 1000);
@@ -78,10 +84,13 @@ export class TroubleshootingAgent {
     this.startedAt = null;
     this.status = 'stopped';
     this._log(`stopped (accumulated ${delta}s)`);
+
+    // === narration (shutdown)
+    broadcastNarration(`Agent B has stopped (runtime ${delta}s).`);
+
     return 'OK: stopped';
   }
 
-  // --- helpers ---
   async _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   async _fetchSite(siteId) {
@@ -125,7 +134,6 @@ export class TroubleshootingAgent {
       steps.push({ action: 'rru.ensure', args: { siteId, antenna: 'a2' }, reason: 'Heal A2 to Available' });
     }
 
-    // Battery saver: keep A1 only when grid down + low battery and both up
     const batt = Number(site?.batteryPercent ?? 100);
     const a1Up = site?.antenna1?.service === 'Available';
     const a2Up = site?.antenna2?.service === 'Available';
@@ -144,7 +152,9 @@ export class TroubleshootingAgent {
       await power({ sites: args.siteId, state: 'on' }).catch(() => null);
       this._log(`power ON issued for ${args.siteId}`);
       supervisorNote(`Troubleshooting: powered ON ${args.siteId}`);
-      // Give the sim time to boot fully before touching RRUs
+
+      broadcastNarration(`Agent B: Attempting to restore power at site ${args.siteId}.`);
+
       await this._sleep(BOOT_SETTLE_MS);
       return { ok: true };
     }
@@ -152,16 +162,16 @@ export class TroubleshootingAgent {
     if (action === 'rru.off') {
       await rru({ site: args.siteId, antenna: args.antenna, state: 'off' }).catch(() => null);
       this._log(`RRU OFF issued ${args.siteId} ${args.antenna}`);
+      broadcastNarration(`Agent B: Temporarily disabling antenna ${args.antenna} to preserve battery at ${args.siteId}.`);
       return { ok: true };
     }
 
     if (action === 'rru.ensure') {
-      // Make sure the antenna ends in Available, not just "ON" command issued.
+      broadcastNarration(`Agent B: Healing radio ${args.antenna.toUpperCase()} at ${args.siteId}…`);
       return await this._healRadio(args.siteId, args.antenna);
     }
 
     if (action === 'rru.on') {
-      // (used by _healRadio internally, but kept for completeness)
       await rru({ site: args.siteId, antenna: args.antenna, state: 'on' }).catch(() => null);
       this._log(`RRU ON issued ${args.siteId} ${args.antenna}`);
       return { ok: true };
@@ -171,14 +181,12 @@ export class TroubleshootingAgent {
   }
 
   async _healRadio(siteId, antenna) {
-    // Attempt sequence: ON → check → if still Unavailable, OFF → ON (reset) → check, repeat up to MAX_RRU_ATTEMPTS
     for (let attempt = 1; attempt <= MAX_RRU_ATTEMPTS; attempt++) {
       await rru({ site: siteId, antenna, state: 'on' }).catch(() => null);
       this._log(`RRU ON issued ${siteId} ${antenna} (attempt ${attempt}/${MAX_RRU_ATTEMPTS})`);
       await this._sleep(RECHECK_MS);
       let s = await this._fetchSite(siteId);
 
-      // Occasionally after power returns the site toggles alive; wait extra if needed
       if (s && s.mains === 'on' && !s.siteAlive) {
         this._log(`waiting siteAlive after RRU ON on ${siteId}…`);
         s = await this._waitAndGet(siteId, 3, RECHECK_MS) || s;
@@ -187,7 +195,6 @@ export class TroubleshootingAgent {
       const svc = antenna === 'a1' ? s?.antenna1?.service : s?.antenna2?.service;
       if (svc === 'Available') return { ok: true };
 
-      // Reset if still unavailable
       await rru({ site: siteId, antenna, state: 'off' }).catch(() => null);
       this._log(`RRU RESET step (OFF) ${siteId} ${antenna} (attempt ${attempt})`);
       await this._sleep(400);
@@ -199,22 +206,26 @@ export class TroubleshootingAgent {
       const svc2 = antenna === 'a1' ? s2?.antenna1?.service : s2?.antenna2?.service;
       if (svc2 === 'Available') return { ok: true };
     }
+
+    // suppress repeated failure narration for same site/antenna for a short window
+    const key = `${siteId}:${antenna}`;
+    const last = healFailureSeen.get(key);
+    const now = Date.now();
+    if (!last || now - last > HEAL_FAIL_SUPPRESS_MS) {
+      healFailureSeen.set(key, now);
+      broadcastNarration(`Agent B: Radio ${antenna.toUpperCase()} at ${siteId} could not be restored after several attempts.`);
+    }
+
     this._log(`RRU HEAL failed ${siteId} ${antenna} after ${MAX_RRU_ATTEMPTS} attempt(s)`);
     return { ok: false, error: 'rru_unavailable' };
   }
 
-  /**
-   * Mitigation with alarm sweep and radio healing.
-   * - E2E automation: executes plan & up to MAX_SWEEPS sweeps.
-   * - Human-in-the-loop: returns a plan (no changes).
-   */
   async mitigateSite(siteId) {
     if (this.status !== 'running') return { ok: false, error: 'Agent not running' };
 
     const policy = getPolicy();
     const e2e = String(policy?.waysOfWorking || '').toLowerCase() === 'e2e automation';
 
-    // initial snapshot
     let site = await this._fetchSite(siteId);
     if (!site) {
       this._log(`mitigate: site ${siteId} not found`);
@@ -225,33 +236,33 @@ export class TroubleshootingAgent {
       `mitigate: start ${siteId} (mains=${site.mains}, alive=${site.siteAlive}, batt=${site.batteryPercent}%, policy.wow="${policy?.waysOfWorking}")`
     );
 
+    broadcastNarration(`Agent B: Starting mitigation at ${siteId} (battery ${site.batteryPercent}%).`);
+
     const initial = this._buildPlan(siteId, site);
 
     if (!e2e) {
-      // HITL → return plan, do not execute
       const planText = initial.steps.map(s => `- ${s.action} ${JSON.stringify(s.args)} | ${s.reason}`).join('\n');
       supervisorNote(`Troubleshooting (HITL): Proposed plan for ${siteId}:\n${planText || '(no actions needed)'}`);
       this._log(`policy HITL → approval required for ${siteId}, ${initial.steps.length} step(s)`);
+
+      broadcastNarration(`Agent B: Awaiting approval to execute a ${initial.steps.length}-step plan at ${siteId}.`);
+
       return { ok: false, error: 'approval_required', plan: initial.steps, alarms: initial.alarms, site };
     }
 
-    // E2E execution
     const actionsTaken = [];
-    // First pass (initial plan)
     for (const step of initial.steps) {
       await this._applyStep(step, site);
       actionsTaken.push(step);
       await this._sleep(BETWEEN_ACTION_MS);
     }
 
-    // Extra settle if we just restored power so radios/CLI can catch up
     site = await this._waitAndGet(siteId, 2, RECHECK_MS) || site;
     if (site.mains === 'on' && !site.siteAlive) {
       this._log(`waiting for ${siteId} to fully boot after power on…`);
       site = await this._waitAndGet(siteId, 3, RECHECK_MS + 300) || site;
     }
 
-    // Alarm sweeps (heal radios until they become Available or we hit the cap)
     let pass = 0;
     while (pass < MAX_SWEEPS) {
       pass += 1;
@@ -262,9 +273,8 @@ export class TroubleshootingAgent {
       const mainsOff = alarms.some(a => a.code === 'Mains.Off');
       const siteDown = alarms.some(a => a.code === 'Site.Down');
 
-      if (!mainsOff && !siteDown && radioAlarms.length === 0) break; // all clear
+      if (!mainsOff && !siteDown && radioAlarms.length === 0) break;
 
-      // If power just came back but radios are still Unavailable, heal each antenna deterministically
       for (const ra of radioAlarms) {
         const antenna = ra.code.includes('A1') ? 'a1' : 'a2';
         const ok = await this._healRadio(siteId, antenna);
@@ -273,7 +283,6 @@ export class TroubleshootingAgent {
         await this._sleep(BETWEEN_ACTION_MS);
       }
 
-      // If mains still off, try once more to bring it back (in case of race)
       if (mainsOff) {
         await power({ sites: siteId, state: 'on' }).catch(() => null);
         this._log(`retry power ON for ${siteId} during sweep`);
@@ -282,7 +291,6 @@ export class TroubleshootingAgent {
       }
     }
 
-    // Final status
     site = await this._waitAndGet(siteId, 2, RECHECK_MS) || site;
     const finalAlarms = this._detectAlarms(site);
     const clearedAlarms = (initial.alarms || []).filter(a0 => !finalAlarms.find(a1 => a1.code === a0.code));
@@ -294,7 +302,9 @@ export class TroubleshootingAgent {
 
     if (allClear) {
       supervisorNote(`Troubleshooting: ${siteId} restored and alarms cleared (${clearedAlarms.length} cleared).`);
-      // ---- Terminal signal (resolved) → Supervisor will quiesce B & C
+
+      broadcastNarration(`Agent B: ${siteId} fully restored. All alarms cleared.`);
+
       incidentBus.emit('incident.resolved', {
         siteId,
         incidentId: `${siteId}-${Date.now()}`,
@@ -303,7 +313,9 @@ export class TroubleshootingAgent {
       });
     } else {
       supervisorNote(`Troubleshooting: ${siteId} stabilized; remaining alarms=${finalAlarms.map(a => a.code).join(', ') || 'none'}.`);
-      // ---- Terminal-enough signal (stabilized) → Supervisor will quiesce B & C
+
+      broadcastNarration(`Agent B: ${siteId} stabilised. Remaining alarms: ${finalAlarms.map(a=>a.code).join(', ') || 'none'}.`);
+
       incidentBus.emit('incident.stabilized', {
         siteId,
         incidentId: `${siteId}-${Date.now()}`,

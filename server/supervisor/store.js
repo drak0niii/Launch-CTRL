@@ -1,63 +1,94 @@
 // server/supervisor/store.js
-// Supervisor (Manager) — in-memory state, logs, SSE, and orchestration
+// Supervisor (Manager) — in-memory state, logs, SSE, orchestration, and narration (Hybrid)
 
+// -----------------------------------------------------------------------------------------
+// Imports
+// -----------------------------------------------------------------------------------------
 import { EventEmitter } from 'events';
 import { getPolicy, onChange as onPolicyChange } from '../policy/store.js';
 import { incidentBus, onIncident } from '../bus/incidentBus.js';
-import { getTowerSnapshot } from '../tower/bridge.js'; // ← cold-start sweep source
-// avoid circulars: lazy-import agents only when needed
-import { getAutoStatus as _getAutoStatus, quiesceDownstreamAgents } from './pipeline.js';
+import { getTowerSnapshot } from '../tower/bridge.js';
 
-const logSubscribers = new Set();     // SSE clients for logs
-const bus = new EventEmitter();       // event bus for snapshot stream
+// Pipeline (new)
+import {
+  getAutoStatus as _getAutoStatus,
+  quiesceDownstreamAgents,
+  startAgentB,
+  stopAgentB,
+  startAgentC,
+  stopAgentC,
+  snapshot as pipelineSnapshot,
+} from './pipeline.js';
 
-// ---- Alarm/Service visibility tap (one-time, logs only — no routing) ----
+// Agent A only (correlation)
+async function lazyAgentA() {
+  const mod = await import('../agents/correlationAgent.js');
+  return mod.correlationAgent;
+}
+
+// UI narration
+import { broadcastNarration } from '../narrator/registry.js';
+
+// -----------------------------------------------------------------------------------------
+// State
+// -----------------------------------------------------------------------------------------
+const logSubscribers = new Set();
+const bus = new EventEmitter();
+const safeNowIso = () => new Date().toISOString();
+
+// Avoid narration spam by caching last step per site
+const lastNarration = new Map();
+function narrate(siteId, phase, message) {
+  const key = `${siteId}:${phase}`;
+  if (lastNarration.get(key) === message) return;
+  lastNarration.set(key, message);
+  broadcastNarration(message);
+}
+
+// Alarm debug tap
 let _alarmTapWired = false;
 (function wireAlarmTapOnce() {
   if (_alarmTapWired) return;
   _alarmTapWired = true;
 
-  incidentBus.on('alarm.raised',  e => console.log(`[ALARM↑] ${e.siteId} "${e.alarm}" ${e.ts}`));
-  incidentBus.on('alarm.cleared', e => console.log(`[ALARM↓] ${e.siteId} "${e.alarm}" ${e.ts}`));
+  incidentBus.on('alarm.raised', e =>
+    console.log(`[ALARM↑] ${e.siteId} "${e.alarm}" ${e.ts}`)
+  );
+  incidentBus.on('alarm.cleared', e =>
+    console.log(`[ALARM↓] ${e.siteId} "${e.alarm}" ${e.ts}`)
+  );
   incidentBus.on('service.changed', e =>
-    console.log(`[SERVICE] ${e.siteId} ${e.antenna}: ${e.from || '—'} → ${e.to || '—'} ${e.ts}`)
+    console.log(`[SERVICE] ${e.siteId} ${e.antenna}: ${e.from} → ${e.to} ${e.ts}`)
   );
 })();
 
+// -----------------------------------------------------------------------------------------
+// Supervisor Object
+// -----------------------------------------------------------------------------------------
 const supervisor = {
-  status: 'idle',              // 'idle' | 'running' | 'paused' | 'stopped'
-  startedAt: null,             // Date | null
-  runtimeSec: 0,               // accumulates when stopped
-  tasksRouted: 0,              // incremented when we trigger agents
+  status: 'idle',
+  startedAt: null,
+  runtimeSec: 0,
+  tasksRouted: 0,
   lastNote: null,
-  logs: [],                    // string[]
-  approvals: [],               // [{id, siteId, actions, reason, createdAt}]
+  logs: [],
+  approvals: [],
   nextApprovalId: 1,
-};
-
-// ---------- small utils ----------
-const safeNowIso = () => new Date().toISOString();
-const isE2E = () => String(getPolicy()?.waysOfWorking || '').toLowerCase() === 'e2e automation';
-const getAutoStatus = () => {
-  try { return typeof _getAutoStatus === 'function' ? (_getAutoStatus() || {}) : {}; }
-  catch { return {}; }
-};
-const autoEffective = () => {
-  const polAllows = isE2E();
-  const stored = !!getAutoStatus().enabled;
-  return polAllows || stored;
 };
 
 function _log(msg) {
   const line = `[${safeNowIso()}] [SUPERVISOR] ${msg}`;
   supervisor.logs.push(line);
   if (supervisor.logs.length > 2000) supervisor.logs.shift();
+
   for (const res of logSubscribers) {
     try { res.write(`data: ${line}\n\n`); } catch {}
   }
 }
 
-// ---------- SSE: logs ----------
+// -----------------------------------------------------------------------------------------
+// SSE — Logs
+// -----------------------------------------------------------------------------------------
 function subscribeLogs(res) {
   logSubscribers.add(res);
   res.on('close', () => {
@@ -66,13 +97,16 @@ function subscribeLogs(res) {
   });
 }
 
-// ---------- public snapshot ----------
+// -----------------------------------------------------------------------------------------
+// Summary + Stream (SSE)
+// -----------------------------------------------------------------------------------------
 function summary() {
-  const live = supervisor.startedAt ? Math.floor((Date.now() - supervisor.startedAt.getTime()) / 1000) : 0;
+  const live = supervisor.startedAt
+    ? Math.floor((Date.now() - supervisor.startedAt.getTime()) / 1000)
+    : 0;
+
   const pol = getPolicy();
-  const storedAutoEnabled = !!getAutoStatus().enabled;
-  const policyAllowsAuto = isE2E();
-  const autoEnabled = policyAllowsAuto || storedAutoEnabled;
+  const storedAutoEnabled = !!_getAutoStatus().enabled;
 
   return {
     status: supervisor.status,
@@ -80,14 +114,16 @@ function summary() {
     runtimeSec: supervisor.runtimeSec + live,
     tasksRouted: supervisor.tasksRouted,
     lastNote: supervisor.lastNote,
-    autoEnabled,               // EFFECTIVE (policy OR stored toggle)
-    storedAutoEnabled,         // raw toggle from pipeline
+    autoEnabled: storedAutoEnabled || String(pol?.waysOfWorking || '').toLowerCase() === 'e2e automation',
+    storedAutoEnabled,
     approvalsPending: supervisor.approvals.length,
     policy: pol,
+
+    // 🔥 NEW — Pipeline status for UI
+    pipeline: pipelineSnapshot(),
   };
 }
 
-// ---------- snapshot stream helpers ----------
 function broadcast() {
   bus.emit('supervisor', summary());
 }
@@ -100,12 +136,15 @@ function subscribeStream(res) {
 
   res.write(`event: supervisor\ndata: ${JSON.stringify(summary())}\n\n`);
 
-  const handler = (snap) => {
+  const handler = snap => {
     try { res.write(`event: supervisor\ndata: ${JSON.stringify(snap)}\n\n`); } catch {}
   };
+
   bus.on('supervisor', handler);
 
-  const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 30000);
+  const ping = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch {}
+  }, 30000);
 
   res.on('close', () => {
     clearInterval(ping);
@@ -114,44 +153,46 @@ function subscribeStream(res) {
   });
 }
 
-// ---------- Agent helpers ----------
-async function lazyAgentA() {
-  const mod = await import('../agents/correlationAgent.js');
-  return mod.correlationAgent;
-}
-async function lazyAgentB() {
-  // keep your file names; adjust if your actual file is troubleshootingAgent.js
-  const mod = await import('../agents/troubleshooting.js');
-  return mod.troubleshootingAgent;
-}
-async function lazyAgentC() {
-  // keep your file names; adjust if your actual file is rcaAgent.js
-  const mod = await import('../agents/rca.js');
-  return mod.rcaAgent;
-}
+// -----------------------------------------------------------------------------------------
+// EFFECTIVE AUTO MODE
+// -----------------------------------------------------------------------------------------
+const isE2E = () =>
+  String(getPolicy()?.waysOfWorking || '').toLowerCase() === 'e2e automation';
+
+const getAutoStatus = () => {
+  try { return _getAutoStatus() || {}; }
+  catch { return {}; }
+};
+
+const autoEffective = () => isE2E() || !!getAutoStatus().enabled;
+
+// -----------------------------------------------------------------------------------------
+// Agent Lifecycle
+// -----------------------------------------------------------------------------------------
 async function ensureAgentsRunning() {
-  try { const a = await lazyAgentA(); if (a.status !== 'running') a.start(); } catch (e) { _log(`Agent A start err: ${String(e?.message || e)}`); }
-  try { const b = await lazyAgentB(); if (b.status !== 'running') b.start(); } catch (e) { _log(`Agent B start err: ${String(e?.message || e)}`); }
-  try { const c = await lazyAgentC(); if (c.status !== 'running') c.start(); } catch (e) { _log(`Agent C start err: ${String(e?.message || e)}`); }
-}
-async function ensureAgentsStopped() {
-  try { const a = await lazyAgentA(); a.stop?.(); } catch {}
-  try { const b = await lazyAgentB(); b.stop?.(); } catch {}
-  try { const c = await lazyAgentC(); c.stop?.(); } catch {}
+  try { await startAgentB(); } catch {}
+  try { await startAgentC(); } catch {}
 }
 
-// ---------- lifecycle ----------
+async function ensureAgentsStopped() {
+  try { await stopAgentB(); } catch {}
+  try { await stopAgentC(); } catch {}
+}
+
+// -----------------------------------------------------------------------------------------
+// Cold Start Sweep (Synthesizes alarms for existing state)
+// -----------------------------------------------------------------------------------------
 async function coldStartSweep() {
   try {
     const snap = await getTowerSnapshot();
     if (!snap?.ok) return;
-    // We expect structure: { sites: { [siteId]: { alarms: string[] } } }
+
     const sites = snap.sites || {};
     let count = 0;
+
     for (const [siteId, site] of Object.entries(sites)) {
       const alarms = Array.isArray(site?.alarms) ? site.alarms : [];
       for (const alarm of alarms) {
-        // Synthesize an alarm.raised so the pipeline treats existing faults as actionable
         await handleEvent({
           type: 'alarm.raised',
           siteId,
@@ -162,60 +203,84 @@ async function coldStartSweep() {
         count++;
       }
     }
-    if (count > 0) _log(`cold-start sweep → synthesized ${count} alarm.raised events`);
+
+    if (count > 0) _log(`cold-start synthesized ${count} alarm.raised events`);
   } catch (e) {
-    _log(`cold-start sweep error: ${String(e?.message || e)}`);
+    _log(`cold-start sweep error: ${String(e)}`);
   }
 }
 
+// -----------------------------------------------------------------------------------------
+// Supervisor Controls
+// -----------------------------------------------------------------------------------------
 async function start() {
   if (supervisor.status === 'running') return 'Already running';
-  if (supervisor.status === 'paused') {
-    resume();
-    return 'Resumed';
-  }
+  if (supervisor.status === 'paused') { resume(); return 'Resumed'; }
+
   supervisor.status = 'running';
   supervisor.startedAt = new Date();
+
   _log('started');
-  await ensureAgentsRunning();     // ← Supervisor controls agents
-  await coldStartSweep();          // ← process pre-existing alarms
+  broadcastNarration("Supervisor is now online and monitoring network events.");
+  await ensureAgentsRunning();
+  await coldStartSweep();
   broadcast();
   return 'OK: started';
 }
 
-function stop() {
+async function stop() {
   if (supervisor.status === 'running' || supervisor.status === 'paused') {
     const delta = Math.floor((Date.now() - (supervisor.startedAt?.getTime() || Date.now())) / 1000);
     supervisor.runtimeSec += Math.max(0, delta);
   }
+
   supervisor.startedAt = null;
   supervisor.status = 'stopped';
-  ensureAgentsStopped();           // ← Supervisor stops agents
-  // Also ensure downstream agents are quiesced (idempotent)
-  quiesceDownstreamAgents?.('supervisor.stopped');
+
+  try {
+    await ensureAgentsStopped();
+  } catch (e) {
+    _log(`stop: ensureAgentsStopped error → ${String(e)}`);
+  }
+
+  try {
+    await quiesceDownstreamAgents('supervisor.stopped');
+  } catch (e) {
+    _log(`stop: quiesceDownstreamAgents error → ${String(e)}`);
+  }
+
   _log('stopped');
+  broadcastNarration("Supervisor has been stopped.");
   broadcast();
   return 'OK: stopped';
 }
 
 function pause() {
   if (supervisor.status !== 'running') return 'Not running';
-  const delta = Math.floor((Date.now() - (supervisor.startedAt?.getTime() || Date.now())) / 1000);
-  supervisor.runtimeSec += Math.max(0, delta);
+
+  const delta = Math.floor((Date.now() - supervisor.startedAt.getTime()) / 1000);
+  supervisor.runtimeSec += delta;
+
   supervisor.startedAt = null;
   supervisor.status = 'paused';
+
   _log('paused');
+  broadcastNarration("Supervisor has paused operations.");
   broadcast();
   return 'OK: paused';
 }
 
 function resume() {
   if (supervisor.status !== 'paused') return 'Not paused';
+
   supervisor.startedAt = new Date();
   supervisor.status = 'running';
+
   _log('resumed');
-  ensureAgentsRunning();           // keep agents in sync
+  broadcastNarration("Supervisor has resumed operations.");
+  ensureAgentsRunning();
   broadcast();
+
   return 'OK: resumed';
 }
 
@@ -226,224 +291,346 @@ function note(message) {
   return 'OK: noted';
 }
 
-// ---------- approvals (HITL) ----------
+// -----------------------------------------------------------------------------------------
+// HITL Approvals
+// -----------------------------------------------------------------------------------------
 function addApprovalRequest({ siteId, actions = [], reason = '' }) {
   const id = String(supervisor.nextApprovalId++);
   const item = { id, siteId, actions, reason, createdAt: safeNowIso() };
+
   supervisor.approvals.push(item);
   supervisor.lastNote = `Approval requested #${id} for ${siteId}`;
-  _log(`approval.requested → #${id} site=${siteId} reason="${reason}" steps=${actions.length}`);
+
+  _log(`approval.requested → #${id} site=${siteId}`);
   broadcast();
+
+  narrate(
+    siteId,
+    "approval",
+    `Troubleshooting for site ${siteId} requires operator approval.`
+  );
+
   return item;
 }
+
 function listApprovals() {
   return supervisor.approvals.slice();
 }
+
 function resolveApproval(id, decision) {
   const idx = supervisor.approvals.findIndex(a => a.id === id);
   if (idx === -1) return null;
+
   const [item] = supervisor.approvals.splice(idx, 1);
   supervisor.lastNote = `Approval ${decision} for #${id}`;
-  _log(`approval.${decision} → #${id} site=${item.siteId}`);
+
+  _log(`approval.${decision} → #${id}`);
   broadcast();
+
+  narrate(
+    item.siteId,
+    "approvalResolve",
+    decision === "approved"
+      ? `Approval granted for site ${item.siteId}. Continuing troubleshooting.`
+      : `Approval rejected for site ${item.siteId}.`
+  );
+
   return item;
 }
+
 function incrementTasksRouted(n = 1) {
   supervisor.tasksRouted = (supervisor.tasksRouted || 0) + n;
 }
 
-// React to policy changes (logs AND broadcast a fresh summary)
-onPolicyChange((p) => {
-  _log(
-    `policy.changed → { alarmPrioritization: "${p.alarmPrioritization}", waysOfWorking: "${p.waysOfWorking}", kpiAlignment: "${p.kpiAlignment}", v:${p.version} }`
-  );
-  broadcast();
-});
-
-// ---------- exact-duplicate guard (event-id ledger) ----------
-const processed = new Map(); // id -> ts
-const PROCESSED_TTL_MS = 60_000; // keep ids for 60s to avoid WS/HTTP mirror dupes
+// -----------------------------------------------------------------------------------------
+// Duplicate Event Guard
+// -----------------------------------------------------------------------------------------
+const processed = new Map();
+const PROCESSED_TTL_MS = 60000;
 
 function eventId(evt) {
-  const t = String(evt?.type || '');
-  const s = String(evt?.siteId || '');
-  const a = String(evt?.alarm || '');
-  // Timestamps can be high-res; normalize to the exact string you get
-  const ts = String(evt?.timestamp || evt?.ts || '');
-  return `${t}|${s}|${a}|${ts}`;
+  return [
+    evt?.type || '',
+    evt?.siteId || '',
+    evt?.alarm || '',
+    evt?.timestamp || evt?.ts || ''
+  ].join('|');
 }
 
 function remember(id) {
   processed.set(id, Date.now());
-  // light pruning
   if (processed.size > 5000) {
     const cutoff = Date.now() - PROCESSED_TTL_MS;
-    for (const [k, v] of processed) {
-      if (v < cutoff) processed.delete(k);
+    for (const [key, val] of processed) {
+      if (val < cutoff) processed.delete(key);
     }
   }
 }
 
-// ============================================================================
-// 🧭 INCIDENT BUS → SUPERVISOR (orchestrates A→B→C flow)
-// ============================================================================
+// -----------------------------------------------------------------------------------------
+// Main Event Orchestration
+// -----------------------------------------------------------------------------------------
 async function handleEvent(evt) {
   const id = eventId(evt);
-  if (processed.has(id)) {
-    _log(`event.duplicate → ${id}`);
-    return; // exact same event already handled; do not run again
-  }
+  if (processed.has(id)) return;
   remember(id);
 
-  const siteId = (evt?.siteId && String(evt.siteId).trim()) || null;
-  _log(`bus.event → ${JSON.stringify({ type: evt?.type, siteId, alarm: evt?.alarm, ts: evt?.timestamp || evt?.ts })}`);
+  const siteId = evt?.siteId;
+  if (!siteId) return;
 
-  if (supervisor.status !== 'running') {
-    _log('supervisor.idle → ignoring bus event');
-    return;
-  }
-  if (!siteId) {
-    _log('event.skipped → missing siteId');
-    return;
-  }
+  _log(`bus.event → ${JSON.stringify({ type: evt.type, siteId, alarm: evt.alarm })}`);
 
-  // Actionable types; ignore pure snapshots
+  if (supervisor.status !== 'running') return;
+
+  // Process only meaningful events
   const actionable = new Set(['alarm.raised', 'service.changed']);
-  if (!actionable.has(String(evt?.type))) {
-    _log(`event.skipped → non-actionable type: ${evt?.type}`);
-    return;
-  }
+  if (!actionable.has(evt.type)) return;
 
-  // ---- 1) Ensure Agent A is running, correlate this site/event ----
+  narrate(siteId, "detected", `New event at site ${siteId}. Assessing conditions.`);
+
+  // ---------------------------------------------------------
+  // 1) CORRELATION (Agent A)
+  // ---------------------------------------------------------
   try {
     const agentA = await lazyAgentA();
     if (agentA.status !== 'running') agentA.start();
 
-    const correlateInput = [{
-      siteId,
-      type: evt.alarm || evt.type || 'unknown',
-      timestamp: evt.timestamp || evt.ts || safeNowIso(),
-    }];
-    const corr = agentA.correlate(correlateInput);
+    const corr = agentA.correlate([
+      {
+        siteId,
+        type: evt.alarm || evt.type || 'unknown',
+        timestamp: evt.timestamp || evt.ts || safeNowIso(),
+      }
+    ]);
+
     const incidents = corr?.incidents || [];
-    _log(`Agent A: ${siteId} → ${incidents.length} incident(s)`);
+
+    narrate(
+      siteId,
+      "correlation",
+      incidents.length === 0
+        ? `No incident correlation found at site ${siteId}.`
+        : `Correlation completed. Incident detected at site ${siteId}.`
+    );
 
     if (incidents.length === 0) {
       broadcast();
-      return; // nothing actionable
+      return;
     }
 
-    // ---- 2) Record "investigating" in Agent C immediately ----
+    // ---------------------------------------------------------
+    // 2) Notify Agent C: investigating
+    // ---------------------------------------------------------
     try {
-      const agentC = await lazyAgentC();
+      const agentCMod = await import('../agents/rca.js');
+      const agentC = agentCMod.rcaAgent;
+
       await agentC.recordIncident({
         siteId,
         cause: 'correlated_alarm_cluster',
         actions: [],
         resolution: 'investigating',
       });
-      _log(`Agent C: investigating recorded for ${siteId}`);
-    } catch (e) {
-      _log(`Agent C record (investigating) error: ${String(e?.message || e)}`);
-    }
 
-    // ---- 3) Decide HITL vs E2E and handle Agent B ----
+      narrate(
+        siteId,
+        "investigating",
+        `Investigating incident at site ${siteId}. Preparing troubleshooting workflow.`
+      );
+    } catch (e) {}
+
+    // ---------------------------------------------------------
+    // 3) HITL OR AUTO MODE
+    // ---------------------------------------------------------
     if (!autoEffective()) {
+      // HITL
+      narrate(
+        siteId,
+        "routingB",
+        `Routing site ${siteId} to Agent B (HITL mode).`
+      );
+
       try {
-        const agentB = await lazyAgentB();
-        if (agentB.status !== 'running') agentB.start();
+        const agentBMod = await import('../agents/troubleshooting.js');
+        const agentB = agentBMod.troubleshootingAgent;
 
         const out = await agentB.mitigateSite(siteId);
-        if (out && out.error === 'approval_required') {
+
+        if (out?.error === 'approval_required') {
           addApprovalRequest({
             siteId,
             actions: out.plan || [],
-            reason: 'Troubleshooting HITL plan requires approval',
+            reason: 'Troubleshooting plan requires approval',
           });
-          _log(`HITL: plan queued for approval @ ${siteId} (steps=${(out.plan || []).length})`);
+
+          narrate(
+            siteId,
+            "approvalPending",
+            `Site ${siteId} requires operator approval before continuation.`
+          );
+
         } else {
-          _log(`HITL: result for ${siteId} (ok=${out?.ok}, err=${out?.error || 'none'})`);
+          narrate(
+            siteId,
+            "hitlDone",
+            `Troubleshooting at site ${siteId} completed (HITL).`
+          );
         }
+
       } catch (e) {
-        _log(`Agent B HITL planning error for ${siteId}: ${String(e?.message || e)}`);
+        narrate(
+          siteId,
+          "hitlError",
+          `Error occurred during HITL troubleshooting at site ${siteId}.`
+        );
       }
+
       broadcast();
       return;
     }
 
-    // Auto/E2E → run B
-    try {
-      const agentB = await lazyAgentB();
-      if (agentB.status !== 'running') agentB.start();
+    // ---------------------------------------------------------
+    // AUTO / E2E MODE
+    // ---------------------------------------------------------
+    narrate(
+      siteId,
+      "autoRoute",
+      `Routing site ${siteId} to Agent B for automated troubleshooting.`
+    );
 
+    try {
       incrementTasksRouted(1);
-      _log(`Agent B: mitigating ${siteId}…`);
+      await startAgentB();
+
+      const agentBMod = await import('../agents/troubleshooting.js');
+      const agentB = agentBMod.troubleshootingAgent;
+
       const result = await agentB.mitigateSite(siteId);
 
-      // ---- 4) Inform Agent C of outcome (restored vs stabilized) ----
-      try {
-        const agentC = await lazyAgentC();
-        if (result?.ok && result.allClear) {
-          await agentC.recordIncident({
-            siteId,
-            cause: 'correlated_alarm_cluster',
-            actions: result.actionsTaken || [],
-            resolution: 'restored',
-          });
-          _log(`Agent C: restored recorded for ${siteId}`);
-          // Terminal → quiesce B & C
-          await quiesceDownstreamAgents?.('auto:restored');
-        } else {
-          await agentC.recordIncident({
-            siteId,
-            cause: 'correlated_alarm_cluster',
-            actions: result?.actionsTaken || [],
-            resolution: 'stabilized',
-          });
-          _log(`Agent C: stabilized/dispatch-suggested recorded for ${siteId}`);
-          // Terminal enough for our pipeline → quiesce B & C
-          await quiesceDownstreamAgents?.('auto:stabilized');
-        }
-      } catch (e) {
-        _log(`Agent C record (post-B) error: ${String(e?.message || e)}`);
+      // ---------------------------------------------------------
+      // OUTCOME → Agent C
+      // ---------------------------------------------------------
+      const agentCMod = await import('../agents/rca.js');
+      const agentC = agentCMod.rcaAgent;
+
+      if (result?.ok && result.allClear) {
+        await agentC.recordIncident({
+          siteId,
+          cause: 'correlated_alarm_cluster',
+          actions: result.actionsTaken || [],
+          resolution: 'restored',
+        });
+
+        narrate(
+          siteId,
+          "restored",
+          `Service at site ${siteId} fully restored after automated mitigation.`
+        );
+
+        await quiesceDownstreamAgents('auto:restored');
+
+      } else {
+        await agentC.recordIncident({
+          siteId,
+          cause: 'correlated_alarm_cluster',
+          actions: result?.actionsTaken || [],
+          resolution: 'stabilized',
+        });
+
+        narrate(
+          siteId,
+          "stabilized",
+          `Automated mitigation stabilized site ${siteId}. Dispatch may be required if conditions persist.`
+        );
+
+        await quiesceDownstreamAgents('auto:stabilized');
       }
+
     } catch (e) {
-      _log(`Agent B mitigation error for ${siteId}: ${String(e?.message || e)}`);
+      narrate(
+        siteId,
+        "autoError",
+        `Automated troubleshooting failed at site ${siteId}.`
+      );
     }
+
   } catch (e) {
-    _log(`Agent A correlation error: ${String(e?.message || e)}`);
-  } finally {
+    _log(`Agent A correlation error: ${String(e)}`);
+    narrate(siteId, "correlationFail", `Correlation failed at site ${siteId}.`);
+  }
+  finally {
     broadcast();
   }
 }
 
-// Wire the single normalized stream
-onIncident(async (evt) => {
+// -----------------------------------------------------------------------------------------
+// Tower-Sim Signals (Resolved/Stabilized/Dispatch)
+// -----------------------------------------------------------------------------------------
+incidentBus.on('incident.resolved', async (evt) => {
+  const siteId = evt?.siteId || 'unknown';
+  _log(`terminal.signal → incident.resolved for ${siteId}`);
+
+  narrate(
+    siteId,
+    "terminalResolved",
+    `Incident at site ${siteId} marked resolved.`
+  );
+
+  await quiesceDownstreamAgents('incident.resolved');
+  broadcast();
+});
+
+incidentBus.on('incident.stabilized', async (evt) => {
+  const siteId = evt?.siteId || 'unknown';
+  _log(`terminal.signal → incident.stabilized for ${siteId}`);
+
+  narrate(
+    siteId,
+    "terminalStabilized",
+    `Incident at site ${siteId} considered stabilized.`
+  );
+
+  await quiesceDownstreamAgents('incident.stabilized');
+  broadcast();
+});
+
+incidentBus.on('dispatch.issued', async (evt) => {
+  const siteId = evt?.siteId || 'unknown';
+  _log(`terminal.signal → dispatch.issued for ${siteId}`);
+
+  narrate(
+    siteId,
+    "terminalDispatch",
+    `Dispatch issued for site ${siteId}. Field intervention recommended.`
+  );
+
+  await quiesceDownstreamAgents('dispatch.issued');
+  broadcast();
+});
+
+// -----------------------------------------------------------------------------------------
+// Connect to Bus
+// -----------------------------------------------------------------------------------------
+onIncident(async evt => {
   try { await handleEvent(evt); }
   catch (e) {
-    _log(`handleEvent fatal: ${String(e?.message || e)}`);
+    _log(`handleEvent fatal: ${String(e)}`);
     broadcast();
   }
 });
 
-// ---- Listen for explicit terminal signals from elsewhere and quiesce B & C
-incidentBus.on('incident.resolved', async (evt) => {
-  _log(`terminal.signal → incident.resolved for ${evt?.siteId || 'unknown'}`);
-  await quiesceDownstreamAgents?.('incident.resolved');
-  broadcast();
-});
-incidentBus.on('incident.stabilized', async (evt) => {
-  _log(`terminal.signal → incident.stabilized for ${evt?.siteId || 'unknown'}`);
-  await quiesceDownstreamAgents?.('incident.stabilized');
-  broadcast();
-});
-incidentBus.on('dispatch.issued', async (evt) => {
-  _log(`terminal.signal → dispatch.issued for ${evt?.siteId || 'unknown'}`);
-  await quiesceDownstreamAgents?.('dispatch.issued');
+// -----------------------------------------------------------------------------------------
+// Policy Change
+// -----------------------------------------------------------------------------------------
+onPolicyChange((p) => {
+  _log(`policy.changed → { alarmPrioritization: "${p.alarmPrioritization}", waysOfWorking: "${p.waysOfWorking}", kpiAlignment: "${p.kpiAlignment}", v:${p.version} }`);
+  broadcastNarration("Supervisory policy updated.");
   broadcast();
 });
 
-// ---------- exports ----------
+// -----------------------------------------------------------------------------------------
+// Exports
+// -----------------------------------------------------------------------------------------
 export {
   summary, start, stop, pause, resume, note,
   subscribeLogs, subscribeStream,

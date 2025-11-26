@@ -2,21 +2,73 @@
 
 // === Core live state ===
 let enabled = true;
-let version = 0;                           // ⬅️ Bumps ONLY on ON transitions
+let version = 0;                           // bumps ONLY on power-on
 let updatedAt = new Date().toISOString();
 
-let lastOnAt = null;                       // when we most recently went Online
-let lastOffAt = null;                      // when we most recently went Offline
+let lastOnAt = null;
+let lastOffAt = null;
 
 // === Telemetry ===
-const counts = { on: 0, off: 0 };          // how many times system turned on/off
+const counts = { on: 0, off: 0 };
 const history = [];                        // [{ version, enabled, source, updatedAt }]
-let uptimeSeconds = 0;                     // accumulates across ON windows
+let uptimeSeconds = 0;
 
-// === SSE clients ===
-const subscribers = new Set();
+// ======================================================
+// === NEW SSE SUBSCRIBER MODEL (function-based) ========
+// ======================================================
 
-// --- helpers ---
+// Subscribers receive structured events:
+// push({ type: "...", ts: "...", ...payload })
+const systemSubscribers = new Set();
+
+export function subscribeSystemStream(fn) {
+  if (typeof fn === "function") {
+    systemSubscribers.add(fn);
+  }
+}
+
+export function unsubscribeSystemStream(fn) {
+  systemSubscribers.delete(fn);
+}
+
+function broadcastSystem(evt) {
+  for (const fn of systemSubscribers) {
+    try {
+      fn(evt);
+    } catch {}
+  }
+}
+
+// ======================================================
+// === BACKWARD-COMPAT Legacy API (KEEP IT) =============
+// ======================================================
+
+// Old-style direct SSE clients stored raw res objects.
+const legacySubscribers = new Set();
+
+export function subscribe(res) {
+  // Keep old behaviour intact
+  legacySubscribers.add(res);
+  res.on('close', () => {
+    legacySubscribers.delete(res);
+    try { res.end(); } catch {}
+  });
+}
+
+function broadcastLegacy(payload) {
+  const data = JSON.stringify(payload);
+  for (const r of legacySubscribers) {
+    try {
+      r.write(`event: system\n`);
+      r.write(`data: ${data}\n\n`);
+    } catch {}
+  }
+}
+
+// ======================================================
+// === Snapshot Helpers =================================
+// ======================================================
+
 function baseSnapshot() {
   return {
     enabled,
@@ -25,7 +77,7 @@ function baseSnapshot() {
     lastOnAt,
     lastOffAt,
     counts: { ...counts },
-    history: history.slice(-200),          // avoid unbounded growth in payload
+    history: history.slice(-200),
   };
 }
 
@@ -35,17 +87,16 @@ function liveUptime() {
   return Math.max(0, Math.floor((Date.now() - start) / 1000));
 }
 
-function snapshot() {
-  // Report accumulated uptime + live delta if online now
+export function getSystemStateSnapshot() {
   return {
     ...baseSnapshot(),
     uptimeSeconds: uptimeSeconds + liveUptime(),
   };
 }
 
-// === Accessors ===
+// Backward compatibility name
 export function getSystemState() {
-  return snapshot();
+  return getSystemStateSnapshot();
 }
 
 export function getSystemCounts() {
@@ -56,37 +107,45 @@ export function getSystemHistory() {
   return history.slice();
 }
 
+// ======================================================
+// === State Mutation Handler ===========================
+// ======================================================
+
 /**
- * Updates system state and notifies subscribers.
- * Rules:
- *  - Version increments ONLY when transitioning to enabled=true (power ON)
- *  - Turning OFF does NOT increment version
- *  - Uptime accumulates when going from ON -> OFF
- *
- * @param {boolean} next - desired enabled state
- * @param {string} source - who triggered the change ("console:llm", "rest:post", etc.)
+ * Sets system enabled/disabled.
+ * Emits SSE events in BOTH:
+ *   • NEW model  (function subscribers)
+ *   • LEGACY model (raw res.write subscribers)
  */
 export function setSystemEnabled(next, source = 'unknown') {
   const nextEnabled = Boolean(next);
   if (nextEnabled === enabled) {
-    // No state change — still return a fresh snapshot for the caller
-    return snapshot();
+    const snap = getSystemStateSnapshot();
+
+    // still broadcast a NO-OP update in new model
+    broadcastSystem({
+      type: "noop",
+      ts: new Date().toISOString(),
+      state: snap
+    });
+
+    return snap;
   }
 
   const nowIso = new Date().toISOString();
 
   if (nextEnabled) {
-    // === ON transition ===
+    // === POWER ON ===
     enabled = true;
-    version = (version || 0) + 1;         // ⬅️ bump only here
+    version = (version || 0) + 1;
     updatedAt = nowIso;
     lastOnAt = nowIso;
     counts.on += 1;
 
     history.push({ version, enabled: true, source, updatedAt: nowIso });
+
   } else {
-    // === OFF transition ===
-    // Accumulate uptime from the last ON window
+    // === POWER OFF ===
     if (lastOnAt) {
       const started = new Date(lastOnAt).getTime();
       const delta = Math.max(0, Math.floor((Date.now() - started) / 1000));
@@ -98,32 +157,24 @@ export function setSystemEnabled(next, source = 'unknown') {
     lastOffAt = nowIso;
     counts.off += 1;
 
-    // Keep the SAME version for OFF entries
     history.push({ version, enabled: false, source, updatedAt: nowIso });
   }
 
-  // Trim history if needed
+  // trim history
   if (history.length > 200) history.splice(0, history.length - 200);
 
-  broadcast();
-  return snapshot();
-}
+  const snap = getSystemStateSnapshot();
 
-// === SSE subscription ===
-export function subscribe(res) {
-  subscribers.add(res);
-  res.on('close', () => {
-    subscribers.delete(res);
-    try { res.end(); } catch {}
+  // NEW model broadcast
+  broadcastSystem({
+    type: nextEnabled ? "system.on" : "system.off",
+    ts: nowIso,
+    state: snap,
+    source,
   });
-}
 
-// === Broadcast helper ===
-function broadcast() {
-  const payload = JSON.stringify(snapshot());
-  for (const r of subscribers) {
-    try {
-      r.write(`event: system\ndata: ${payload}\n\n`);
-    } catch {}
-  }
+  // LEGACY model broadcast
+  broadcastLegacy(snap);
+
+  return snap;
 }

@@ -21,7 +21,7 @@ export class CorrelationAgent {
     this.windowMs = 5 * 60 * 1000;     // merge window (5m)
 
     // stats
-    this.tasks = 0;                   // 1) ✅ start at zero
+    this.tasks = 0;                   // ✅ counts closed incidents only
     this.lastTask = null;
 
     // state
@@ -29,7 +29,7 @@ export class CorrelationAgent {
     this.subscribers = new Set();
     this._busUnsub = null;
 
-    // perSite correlation buffers
+    // perSite correlation buffers for streaming path
     this.perSite = Object.create(null);
 
     this._log('initialized (stopped, delegation disabled by policy)');
@@ -52,9 +52,13 @@ export class CorrelationAgent {
       status: this.status === 'running' ? 'Active' : 'Stopped',
       delegation: this.delegation === 'enabled' ? 'Enabled' : 'Disabled',
       runtimeSec: this.runtimeSec + live,
-      tasks: this.tasks,
+      tasks: this.tasks,          // ✅ closed-incident counter
       lastTask: this.lastTask,
     };
+  }
+
+  snapshot() {
+    return this.summary;
   }
 
   subscribeLogs(res) {
@@ -79,7 +83,7 @@ export class CorrelationAgent {
 
     // refresh behavior knobs from policy (hook point)
     const p = getPolicy();
-    this.windowMs = 5 * 60 * 1000; // default; extend with policy later if needed
+    this.windowMs = 5 * 60 * 1000; // default; extend via policy if needed
     void p; // silence linter if unused
 
     // subscribe to incident bus
@@ -93,11 +97,10 @@ export class CorrelationAgent {
     if (this.status !== 'running') {
       this.status = 'stopped';
       this._log('stopped (no-op)');
-      // 3) ✅ ensure counter is reset even on no-op stop
-      this.tasks = 0;
-      this.lastTask = null;
+      // keep tasks as history; do NOT reset here
       return 'OK: stopped';
     }
+
     const delta = Math.floor((Date.now() - this.startedAt.getTime()) / 1000);
     this.runtimeSec += delta;
     this.startedAt = null;
@@ -108,11 +111,7 @@ export class CorrelationAgent {
       this._busUnsub = null;
     }
 
-    // 3) ✅ reset counter on stop
-    this.tasks = 0;
-    this.lastTask = null;
-
-    this._log(`stopped (accumulated ${delta}s, tasks reset to 0)`);
+    this._log(`stopped (accumulated ${delta}s, tasks=${this.tasks})`);
     return 'OK: stopped';
   }
 
@@ -127,19 +126,28 @@ export class CorrelationAgent {
     return 'OK: delegation disabled (policy)';
   }
 
-  // ------------- bus handling -------------
+  // ------------- bus handling (streaming path) -------------
   _attachBus() {
     const handler = (evt) => this._onIncident(evt);
     onIncident(handler);
-    return () => { /* no-op disposer; incidentBus currently has no unsubscribe */ };
+    return () => {
+      // current incidentBus adapter has no explicit unsubscribe;
+      // this is a placeholder in case we add one later.
+    };
   }
 
   _onIncident(evt) {
     if (this.status !== 'running') return;
 
     // Visibility only
-    if (evt.type === 'bus.disconnected') { this._log('bus disconnected (tower-sim unavailable)'); return; }
-    if (evt.type === 'bus.reconnected')  { this._log('bus reconnected (tower-sim available)');  return; }
+    if (evt.type === 'bus.disconnected') {
+      this._log('bus disconnected (tower-sim unavailable)');
+      return;
+    }
+    if (evt.type === 'bus.reconnected') {
+      this._log('bus reconnected (tower-sim available)');
+      return;
+    }
 
     // We only correlate alarms and state updates
     const isAlarmEvt = evt.type === 'alarm.raised' || evt.type === 'alarm.cleared';
@@ -152,15 +160,15 @@ export class CorrelationAgent {
     if (isState) {
       const siteSnap = evt?.state?.sites?.[siteId];
       if (siteSnap && siteSnap.siteAlive && siteSnap.mains === 'on') {
-        this._closeOpenIncident(siteId, 'service_restored'); // 2) ✅ counts on close
+        this._closeOpenIncident(siteId, 'service_restored');
       }
       return;
     }
 
     // --- Alarm events: filter noise first ---
     const alarm = evt.alarm || evt.type || 'unknown';
-    if (!siteId || siteId === 'unknown') return;         // skip unknown site noise
-    if (isNoiseAlarm(alarm)) return;                      // skip unknown/heartbeat/noop
+    if (!siteId || siteId === 'unknown') return;   // skip unknown site noise
+    if (isNoiseAlarm(alarm)) return;               // skip unknown/heartbeat/noop
 
     // Policy-aware filter (case-insensitive)
     const policyMode = String(getPolicy()?.alarmPrioritization || '').toLowerCase() || 'critical first';
@@ -176,13 +184,13 @@ export class CorrelationAgent {
 
     if (!s.open) {
       s.open = this._newIncident(siteId, evt);
-      this._notifyStart(s.open);           // 🔄 no tasks increment here
+      this._notifyStart(s.open);      // no tasks increment here
     } else if (withinWindow) {
       this._extend(s.open, evt);
     } else {
-      this._closeOpenIncident(siteId, 'window_elapsed'); // 2) ✅ counts on close
+      this._closeOpenIncident(siteId, 'window_elapsed');
       s.open = this._newIncident(siteId, evt);
-      this._notifyStart(s.open);           // 🔄 no tasks increment here
+      this._notifyStart(s.open);
     }
 
     // If the alarm cleared and no critical remains, close early
@@ -191,12 +199,12 @@ export class CorrelationAgent {
         ? [...s.open.types].some(isCriticalAlarm)
         : false;
       if (!hasCritical) {
-        this._closeOpenIncident(siteId, 'alarm_cleared'); // 2) ✅ counts on close
+        this._closeOpenIncident(siteId, 'alarm_cleared');
       }
     }
   }
 
-  // ------------- correlation primitives -------------
+  // ------------- correlation primitives (streaming) -------------
   _ensureSite(siteId) {
     if (!this.perSite[siteId]) this.perSite[siteId] = { open: null, closed: [] };
     return this.perSite[siteId];
@@ -239,10 +247,9 @@ export class CorrelationAgent {
     s.closed.push(out);
 
     this.lastTask = `incident.closed ${siteId} (${reason}) with ${out.count} events`;
-    this.tasks += 1;                              // 2) ✅ exactly one task per closed incident
+    this.tasks += 1;                              // ✅ one task per closed streaming incident
     this._log(this.lastTask);
 
-    // Inform Supervisor (fire-and-forget)
     supervisorNote(
       `Correlation: closed incident @${siteId} (${reason}). Alarms: ${out.types.join(', ')}`
     );
@@ -250,19 +257,18 @@ export class CorrelationAgent {
   }
 
   _notifyStart(inc) {
-    // 🔄 Do NOT increment tasks on start — only log
     this.lastTask = `incident.started ${inc.siteId} (alarms=${[...inc.types].join(', ')})`;
     this._log(this.lastTask);
 
-    // Inform Supervisor (fire-and-forget)
     supervisorNote(
       `Correlation: started incident @${inc.siteId} (${[...inc.types].join(', ')})`
     );
   }
 
-  // ------------- utility (optional external call) -------------
+  // ------------- correlate() used by Supervisor (read-only for tasks) -------------
   correlate(events = []) {
-    // Batch-correlation with the same noise & policy filters applied.
+    // Batch-correlation with same noise & policy filters,
+    // but **does not** mutate this.tasks — streaming path owns task counting.
     const policyMode = String(getPolicy()?.alarmPrioritization || '').toLowerCase() || 'critical first';
 
     const filtered = events.filter((e) => {
@@ -303,7 +309,13 @@ export class CorrelationAgent {
       for (const ev of list) {
         const t = new Date(ev.timestamp).getTime();
         if (!cur) {
-          cur = { start: ev.timestamp, end: ev.timestamp, count: 1, types: new Set([ev.type || ev.alarm]), events: [ev] };
+          cur = {
+            start: ev.timestamp,
+            end: ev.timestamp,
+            count: 1,
+            types: new Set([ev.type || ev.alarm]),
+            events: [ev],
+          };
           continue;
         }
         const last = new Date(cur.end).getTime();
@@ -314,16 +326,22 @@ export class CorrelationAgent {
           cur.events.push(ev);
         } else {
           PUSH();
-          cur = { start: ev.timestamp, end: ev.timestamp, count: 1, types: new Set([ev.type || ev.alarm]), events: [ev] };
+          cur = {
+            start: ev.timestamp,
+            end: ev.timestamp,
+            count: 1,
+            types: new Set([ev.type || ev.alarm]),
+            events: [ev],
+          };
         }
       }
       PUSH();
     }
 
-    // 2) ✅ increment by the exact number of incidents produced
-    this.lastTask = `correlated ${filtered.length} events → ${incidents.length} incidents`;
-    this.tasks += incidents.length;
+    // Log correlation outcome, but do NOT change tasks
+    this.lastTask = `correlated ${filtered.length} events → ${incidents.length} incidents (read-only)`;
     this._log(this.lastTask);
+
     return { incidents };
   }
 }

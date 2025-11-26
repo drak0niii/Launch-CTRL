@@ -1,105 +1,289 @@
 // server/supervisor/pipeline.js
-// Minimal pipeline + agent helpers.
-// - Holds the manual auto toggle (UI can flip it).
-// - Exposes start/stop helpers for Agent B/C and a quiesce function.
-// - Uses dynamic imports to avoid circular deps with supervisor/store.js & agents.
+// Option A — Corrected & Production-Ready
+// - Clean lifecycle control for Agents B and C
+// - Accurate runtime + task counters
+// - Correct return values
+// - Narration for failures
+// - Predictable quiesce logic
+// - No circular deps
+// - UI-safe snapshot()
 
 import { supervisorNote } from '../tools/supervisorNote.js';
+import { broadcastNarration } from '../narrator/registry.js';
 
-// ----- Manual Auto Toggle (UI hint; policy may still allow auto independently)
-let autoEnabled = false;               // manual toggle; policy may still allow auto independently
-const WINDOW_MS = 3000;                // kept for UI/compat: historical batch window hint
-const QUIET_CHECK_MS = 4000;           // kept for UI/compat: post-mitigation quiet check hint
+// -----------------------------------------------------------------------------
+// Pipeline Local State
+// -----------------------------------------------------------------------------
+let autoEnabled = false;
+const WINDOW_MS = 3000;
+const QUIET_CHECK_MS = 4000;
 
-/**
- * Optionally called by routes/UI to flip the manual auto toggle.
- * Returns the current toggle state.
- */
+// runtime
+let agentBRuntime = 0;
+let agentBStartedAt = null;
+
+let agentCRuntime = 0;
+let agentCStartedAt = null;
+
+// tasks
+let agentBTasks = 0;
+let agentCTasks = 0;
+
+// cached agent instances (so snapshot can read live counters)
+let agentBCache = null;
+let agentCCache = null;
+
+// statuses
+let agentBStatus = 'stopped';
+let agentCStatus = 'stopped';
+
+// quiesce debounce (reason -> ts)
+const lastQuiesce = new Map();
+const QUIESCE_DEBOUNCE_MS = 750;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+function computeRuntime(startedAt, accumulated) {
+  if (!startedAt) return accumulated;
+  return accumulated + Math.floor((Date.now() - startedAt.getTime()) / 1000);
+}
+
+// Lazy-load agents to avoid circular dependencies
+async function loadAgentB() {
+  if (agentBCache) return agentBCache;
+  const mod = await import('../agents/troubleshooting.js');
+  agentBCache = mod.troubleshootingAgent;
+  return agentBCache;
+}
+async function loadAgentC() {
+  if (agentCCache) return agentCCache;
+  const mod = await import('../agents/rca.js');
+  agentCCache = mod.rcaAgent;
+  return agentCCache;
+}
+
+// -----------------------------------------------------------------------------
+// Auto Toggle
+// -----------------------------------------------------------------------------
 export function setAutoEnabled(flag) {
   autoEnabled = !!flag;
+
   supervisorNote(`Auto-pipeline ${autoEnabled ? 'ENABLED' : 'DISABLED'} (manual toggle)`);
+
+  broadcastNarration(
+    autoEnabled
+      ? "Auto-pipeline enabled. Automated mitigation will run when allowed by policy."
+      : "Auto-pipeline disabled. Troubleshooting may require manual routing or approval."
+  );
+
   return { enabled: autoEnabled };
 }
 
-/**
- * Read by supervisor/store.js to compute the effective auto mode:
- * effective = policy(E2E automation) OR getAutoStatus().enabled
- */
 export function getAutoStatus() {
-  return { enabled: autoEnabled, windowMs: WINDOW_MS, quietCheckMs: QUIET_CHECK_MS };
+  return {
+    enabled: autoEnabled,
+    windowMs: WINDOW_MS,
+    quietCheckMs: QUIET_CHECK_MS,
+  };
 }
 
-/**
- * (Deprecated – no-op kept for backward compatibility.)
- * Previous versions listened to the incident bus and orchestrated here.
- * Now the Supervisor handles bus events directly.
- */
-export function initPipeline() {
-  supervisorNote('Pipeline init no-op; orchestration handled by Supervisor.');
-  return { ok: true, message: 'Pipeline init is a no-op; orchestration moved to supervisor/store.js' };
-}
-
-// (Optional) export constants for UI consumption without importing internals
-export const PIPELINE_CONSTANTS = { WINDOW_MS, QUIET_CHECK_MS };
-
-// ---------------------------------------------------------------------------
-// Agent helpers (lazy-import to avoid circulars)
-// ---------------------------------------------------------------------------
-async function withAgent(modPath, exportName, fn) {
-  const mod = await import(modPath);
-  const agent = mod?.[exportName];
-  if (!agent) throw new Error(`Agent export "${exportName}" not found in ${modPath}`);
-  return fn(agent);
-}
-
-// Agent B — Troubleshooting
+// -----------------------------------------------------------------------------
+// AGENT B — Troubleshooting
+// -----------------------------------------------------------------------------
 export async function startAgentB() {
-  return withAgent('../agents/troubleshootingAgent.js', 'troubleshootingAgent', async (agent) => {
+  if (agentBStatus === 'running') {
+    return { ok: true, agent: 'B', status: agentBStatus, snapshot: snapshot() };
+  }
+  try {
+    const agent = await loadAgentB();
+
     if (agent.start) await agent.start();
+
+    agentBCache = agent;
+    agentBStatus = 'running';
+    agentBStartedAt = new Date();
+    agentBTasks = agent.tasks || 0;
+
     supervisorNote('Agent B started');
-    return agent.snapshot?.() ?? { name: 'Agent B', status: 'Active' };
-  });
+    broadcastNarration("Agent B (Troubleshooting) is now online and ready.");
+
+    return {
+      ok: true,
+      agent: 'B',
+      status: agentBStatus,
+      snapshot: snapshot()
+    };
+  } catch (e) {
+    agentBStatus = 'error';
+    supervisorNote(`Agent B failed to start: ${e?.message || e}`);
+    broadcastNarration(`Agent B could not start: ${e?.message || e}.`);
+
+    return { ok: false, agent: 'B', error: String(e) };
+  }
 }
 
 export async function stopAgentB() {
-  return withAgent('../agents/troubleshootingAgent.js', 'troubleshootingAgent', async (agent) => {
+  if (agentBStatus === 'stopped') {
+    return { ok: true, agent: 'B', status: agentBStatus, snapshot: snapshot() };
+  }
+  try {
+    const agent = await loadAgentB();
+
     if (agent.stop) await agent.stop();
+
+    if (agentBStartedAt) {
+      agentBRuntime += Math.floor((Date.now() - agentBStartedAt.getTime()) / 1000);
+    }
+    agentBStartedAt = null;
+
+    agentBStatus = 'stopped';
+    agentBTasks = agent.tasks || 0;
+
     supervisorNote('Agent B stopped');
-    return agent.snapshot?.() ?? { name: 'Agent B', status: 'Stopped' };
-  });
+    broadcastNarration("Agent B (Troubleshooting) has been stopped.");
+
+    return {
+      ok: true,
+      agent: 'B',
+      status: agentBStatus,
+      snapshot: snapshot()
+    };
+  } catch (e) {
+    agentBStatus = 'error';
+    supervisorNote(`Agent B stop error: ${e?.message || e}`);
+    broadcastNarration(`Agent B encountered an error while stopping: ${e?.message || e}.`);
+
+    return { ok: false, agent: 'B', error: String(e) };
+  }
 }
 
-// Agent C — RCA / Dispatch
+// -----------------------------------------------------------------------------
+// AGENT C — RCA / Dispatch
+// -----------------------------------------------------------------------------
 export async function startAgentC() {
-  return withAgent('../agents/rcaAgent.js', 'rcaAgent', async (agent) => {
+  if (agentCStatus === 'running') {
+    return { ok: true, agent: 'C', status: agentCStatus, snapshot: snapshot() };
+  }
+  try {
+    const agent = await loadAgentC();
+
     if (agent.start) await agent.start();
+
+    agentCCache = agent;
+    agentCStatus = 'running';
+    agentCStartedAt = new Date();
+    agentCTasks = agent.tasks || 0;
+
     supervisorNote('Agent C started');
-    return agent.snapshot?.() ?? { name: 'Agent C', status: 'Active' };
-  });
+    broadcastNarration("Agent C (RCA & Dispatch) is now active.");
+
+    return {
+      ok: true,
+      agent: 'C',
+      status: agentCStatus,
+      snapshot: snapshot()
+    };
+  } catch (e) {
+    agentCStatus = 'error';
+    supervisorNote(`Agent C failed to start: ${e?.message || e}`);
+    broadcastNarration(`Agent C could not start: ${e?.message || e}.`);
+
+    return { ok: false, agent: 'C', error: String(e) };
+  }
 }
 
 export async function stopAgentC() {
-  return withAgent('../agents/rcaAgent.js', 'rcaAgent', async (agent) => {
+  if (agentCStatus === 'stopped') {
+    return { ok: true, agent: 'C', status: agentCStatus, snapshot: snapshot() };
+  }
+  try {
+    const agent = await loadAgentC();
+
     if (agent.stop) await agent.stop();
+
+    if (agentCStartedAt) {
+      agentCRuntime += Math.floor((Date.now() - agentCStartedAt.getTime()) / 1000);
+    }
+    agentCStartedAt = null;
+
+    agentCStatus = 'stopped';
+    agentCTasks = agent.tasks || 0;
+
     supervisorNote('Agent C stopped');
-    return agent.snapshot?.() ?? { name: 'Agent C', status: 'Stopped' };
-  });
+    broadcastNarration("Agent C (RCA & Dispatch) has been stopped.");
+
+    return {
+      ok: true,
+      agent: 'C',
+      status: agentCStatus,
+      snapshot: snapshot()
+    };
+  } catch (e) {
+    agentCStatus = 'error';
+    supervisorNote(`Agent C stop error: ${e?.message || e}`);
+    broadcastNarration(`Agent C encountered an error while stopping: ${e?.message || e}.`);
+
+    return { ok: false, agent: 'C', error: String(e) };
+  }
 }
 
-/**
- * Quiesce (turn off) downstream agents when the issue is resolved or dispatched.
- * Idempotent: safe to call even if agents are already stopped.
- */
+// -----------------------------------------------------------------------------
+// QUIESCE — Stops both B & C
+// -----------------------------------------------------------------------------
 export async function quiesceDownstreamAgents(reason = 'pipeline:terminal') {
+  const now = Date.now();
+  const last = lastQuiesce.get(reason);
+  if (last && (now - last) < QUIESCE_DEBOUNCE_MS) {
+    return { ok: true, reason, skipped: 'debounced' };
+  }
+  lastQuiesce.set(reason, now);
   try {
     await Promise.allSettled([
       stopAgentB(),
       stopAgentC(),
     ]);
+
     supervisorNote(`Quiesced Agents B & C (${reason})`);
+    broadcastNarration(`Agents B and C have been quiesced (${reason}).`);
+
     return { ok: true, reason };
   } catch (e) {
     supervisorNote(`Quiesce failed (${reason}): ${e?.message || e}`);
-    return { ok: false, reason, error: String(e?.message || e) };
+    broadcastNarration(`Quiesce of Agents B & C failed: ${e?.message || e}.`);
+
+    return { ok: false, error: String(e), reason };
   }
+}
+
+// -----------------------------------------------------------------------------
+// Snapshot — UI uses this
+// -----------------------------------------------------------------------------
+export function snapshot() {
+  return {
+    manualAutoEnabled: autoEnabled,
+    constants: { WINDOW_MS, QUIET_CHECK_MS },
+
+    agentB: {
+      status: agentBStatus,
+      runtimeSec: computeRuntime(agentBStartedAt, agentBRuntime),
+      tasks: agentBCache?.tasks ?? agentBTasks,
+      startedAt: agentBStartedAt,
+    },
+
+    agentC: {
+      status: agentCStatus,
+      runtimeSec: computeRuntime(agentCStartedAt, agentCRuntime),
+      tasks: agentCCache?.tasks ?? agentCTasks,
+      startedAt: agentCStartedAt,
+    }
+  };
+}
+
+// -----------------------------------------------------------------------------
+// Init
+// -----------------------------------------------------------------------------
+export function initPipeline() {
+  supervisorNote('Pipeline init complete (lifecycle handled by supervisor).');
+  return { ok: true };
 }

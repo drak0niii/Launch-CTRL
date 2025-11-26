@@ -24,6 +24,8 @@ import { motion, AnimatePresence } from 'motion/react';
 import React, { useState, useRef, useEffect } from 'react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
 import { Switch } from './ui/switch';
+import { subscribeToNarration } from '../services/narratorStream';
+
 
 interface InfoSidebarProps {
   showConnections: boolean;
@@ -59,6 +61,16 @@ export function InfoSidebar({
 
   // Track last-known system status so we only log on changes
   const lastEnabledRef = useRef<boolean | null>(null);
+
+  // --- Narration → append to console ---
+useEffect(() => {
+  const stop = subscribeToNarration((msg: string) => {
+    appendLog(`[ASSISTANT] ${msg}`);
+  });
+
+  return () => stop();
+}, []);
+
 
   // auto-scroll logs to bottom
   useEffect(() => {

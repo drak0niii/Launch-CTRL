@@ -55,23 +55,23 @@ router.post('/auto', (req, res) => {
 });
 
 // Controls
-router.post('/start', (_req, res) => {
-  const msg = start(); // engages orchestration in store.js
+router.post('/start', async (_req, res) => {
+  const msg = await start(); // engages orchestration in store.js
   fresh(res).json({ ok: true, message: msg, supervisor: summary() });
 });
 
-router.post('/stop', (_req, res) => {
-  const msg = stop(); // disengages orchestration in store.js
+router.post('/stop', async (_req, res) => {
+  const msg = await stop(); // disengages orchestration in store.js
   fresh(res).json({ ok: true, message: msg, supervisor: summary() });
 });
 
-router.post('/pause', (_req, res) => {
-  const msg = pause();
+router.post('/pause', async (_req, res) => {
+  const msg = await pause();
   fresh(res).json({ ok: true, message: msg, supervisor: summary() });
 });
 
-router.post('/resume', (_req, res) => {
-  const msg = resume();
+router.post('/resume', async (_req, res) => {
+  const msg = await resume();
   fresh(res).json({ ok: true, message: msg, supervisor: summary() });
 });
 

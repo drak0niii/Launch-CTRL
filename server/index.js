@@ -4,12 +4,19 @@ import express from 'express';
 import cors from 'cors';
 import OpenAI from 'openai';
 
+// Narrator stream registry
+import { registerStream } from './narrator/registry.js';
+import narratorRoutes from './routes/narrator.routes.js';
+
+
+
 // Top-level utility routes
 import logsRoutes from './routes/logs.routes.js';
 import rcaRoutes from './routes/rca.routes.js';               // /api/rca  (top-level RCA)
 
 // System state (for console tools)
 import { getSystemState, setSystemEnabled, subscribe } from './system/state.js';
+import { getState as getTowerState } from './tower/client.js';
 
 // Policy + Supervisor
 import policyRoutes from './policy/routes.js';
@@ -49,10 +56,38 @@ import {
   resetConsoleMemory,
   getRecentConsoleMessages,
 } from './memory/storage.js';
+import { rcaAgent } from './agents/rca.js';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Last referenced site (helps answer follow-ups)
+let lastSiteRef = null;
+const recordSiteRef = (siteId) => {
+  if (typeof siteId === 'string' && siteId.trim()) lastSiteRef = siteId.trim();
+};
+const siteFromPrompt = (text = '') => {
+  const m = String(text).match(/\b[A-Z]{2,}[A-Z0-9]{2,}\d{2,}\b/i);
+  return m ? m[0].toUpperCase() : null;
+};
+
+function currentOpsStatus(siteId = null) {
+  const casebook = Array.isArray(rcaAgent.casebook) ? rcaAgent.casebook : [];
+  const unresolved = casebook.filter(c =>
+    !['restored'].includes(String(c.resolution || '').toLowerCase()) || c.dispatchSuggested || c.ongoing
+  );
+
+  const bySite = siteId ? unresolved.filter(c => c.siteId === siteId) : unresolved;
+  const focus = siteId ? latestIncidentForSite(siteId) : null;
+
+  return {
+    site: siteId || null,
+    unresolvedCount: unresolved.length,
+    unresolvedSites: [...new Set(unresolved.map(c => c.siteId))],
+    focusIncident: focus,
+  };
+}
 
 // --- mount routes ---
 app.use('/api/policy', policyRoutes);
@@ -64,6 +99,8 @@ app.use('/api/tower', towerRoutes);
 app.use('/api/bus', busRoutes);
 app.use('/api/logs', logsRoutes);
 app.use('/api/rca', rcaRoutes);               // <- top-level RCA routes
+app.use('/api/narrator', narratorRoutes);
+
 
 // --- tower bridge + pipeline init ---
 initTowerBridge();
@@ -90,6 +127,7 @@ Strict rules (very important):
 - When referring to a prior user message, DO NOT quote it verbatim; paraphrase ("that question", "your greeting") instead.
 - If you must reason over conversation history, consider ONLY user messages; ignore assistant messages for any counts or stats.
 - For system facts (online/offline, counts on/off, version, last update, history, uptime), always use the system tool output; do not guess numbers.
+- This is an autonomous system: agent lifecycle is controlled by the Supervisor. Do NOT manually start/stop individual agents; steer the user to Supervisor controls instead.
 - Keep responses concise and focused on console operations.
 `;
 
@@ -228,6 +266,18 @@ function buildSystemSnapshotLine(state = getSystemState(), extras = {}) {
   return parts.join(' ');
 }
 
+function formatPolicySummary() {
+  const p = getPolicy();
+  if (!p) return 'No policy is configured.';
+  const parts = [
+    `Alarm Prioritization: ${p.alarmPrioritization || 'n/a'}`,
+    `Ways of Working: ${p.waysOfWorking || 'n/a'}`,
+    `KPI Alignment: ${p.kpiAlignment || 'n/a'}`,
+    `Version: ${p.version || 'n/a'}`,
+  ];
+  return `Supervisor policy:\n- ${parts.join('\n- ')}`;
+}
+
 function formatSystemQuery(aspect) {
   const s = getSystemState();
   switch (aspect) {
@@ -277,8 +327,38 @@ function formatPolicyQuery(aspect) {
     case 'values':
       return `Active policy → Alarm: ${p.alarmPrioritization}, WoW: ${p.waysOfWorking}, KPI: ${p.kpiAlignment} (v${p.version ?? 0}, updated ${p.updatedAt ?? 'unknown'}).`;
     default:
-      return `Policy version v${p.version ?? 0} (updated ${p.updatedAt ?? 'unknown'}).`;
+      return formatPolicySummary();
   }
+}
+
+// Incident + site helpers
+function latestIncidentForSite(siteId) {
+  if (!siteId) return null;
+  return rcaAgent.casebook
+    .slice()
+    .reverse()
+    .find(c => c.siteId === siteId && c && !['unknown', 'heartbeat', 'noop'].includes(String(c.cause || '').toLowerCase())) || null;
+}
+
+function deriveAlarms(site) {
+  const alarms = [];
+  if (!site) return alarms;
+  if (site.mains === 'off') alarms.push('Mains.Off');
+  if (site.siteAlive === false) alarms.push('Site.Down');
+  if (site.antenna1?.service === 'Unavailable') alarms.push('Antenna.A1.Unavailable');
+  if (site.antenna2?.service === 'Unavailable') alarms.push('Antenna.A2.Unavailable');
+  return alarms;
+}
+
+function formatActions(actions = []) {
+  if (!Array.isArray(actions) || actions.length === 0) return 'No actions recorded.';
+  return actions.map((a, i) => {
+    if (typeof a === 'string') return `${i + 1}. ${a}`;
+    const act = a?.action || 'action';
+    const args = a?.args ? JSON.stringify(a.args) : '';
+    const reason = a?.reason ? ` (${a.reason})` : '';
+    return `${i + 1}. ${act} ${args}${reason}`;
+  }).join('\n');
 }
 
 /* -------------------- LLM Tools -------------------- */
@@ -301,6 +381,53 @@ const LLM_TOOLS = [
       parameters: {
         type: 'object',
         properties: { limit: { type: 'integer', minimum: 1, maximum: 500, description: 'Max number of messages.' } },
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_site_incident',
+      description:
+        'Return the latest RCA incident record for a site from Agent C casebook: { siteId, ts, cause, resolution, ongoing, dispatchSuggested, summary }',
+      parameters: {
+        type: 'object',
+        properties: {
+          siteId: { type: 'string', description: 'Site identifier, e.g., NYNYNJ0836' },
+        },
+        required: ['siteId'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_site_state',
+      description:
+        'Return the latest tower state for a specific site from tower-sim snapshot, including derived alarms.',
+      parameters: {
+        type: 'object',
+        properties: {
+          siteId: { type: 'string', description: 'Site identifier, e.g., TX0482' },
+        },
+        required: ['siteId'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'get_ops_status',
+      description:
+        'Return current operational status: unresolved incidents (filtered optionally by site), unresolvedSites list, and focus incident if applicable.',
+      parameters: {
+        type: 'object',
+        properties: {
+          siteId: { type: 'string', description: 'Optional site to focus on' },
+        },
         additionalProperties: false,
       },
     },
@@ -340,6 +467,33 @@ async function runLLMWithTools(messages) {
         }
         const msgs = await getRecentConsoleMessages(limit);
         toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ messages: msgs }) });
+      } else if (toolName === 'get_site_incident') {
+        const args = rawArgs ? JSON.parse(rawArgs) : {};
+        const siteId = args?.siteId;
+        recordSiteRef(siteId);
+        const latest = latestIncidentForSite(siteId);
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ incident: latest || null }) });
+      } else if (toolName === 'get_site_state') {
+        try {
+          const args = rawArgs ? JSON.parse(rawArgs) : {};
+          const siteId = args?.siteId;
+          recordSiteRef(siteId);
+          const state = await getTowerState().catch(() => null);
+          const snap = state?.state || state;
+          const site = snap?.sites?.[siteId] || null;
+          const alarms = deriveAlarms(site);
+          toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ site, alarms }) });
+        } catch (err) {
+          toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: String(err?.message || err) }) });
+        }
+      } else if (toolName === 'get_ops_status') {
+        const args = rawArgs ? JSON.parse(rawArgs) : {};
+        const siteId = args?.siteId;
+        recordSiteRef(siteId);
+        const status = currentOpsStatus(siteId || null);
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(status) });
+      } else {
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: `unknown_tool:${toolName || 'n/a'}` }) });
       }
     } catch (e) {
       toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: String(e?.message || e || 'tool_error') }) });
@@ -359,6 +513,99 @@ async function runLLMWithTools(messages) {
   return second.choices?.[0]?.message?.content ?? '';
 }
 
+/**
+ * Streaming helper following the same tool-call pattern as runLLMWithTools.
+ * Emits content chunks via onChunk and returns the full text.
+ */
+async function runLLMWithToolsStream(messages, onChunk = () => {}) {
+  const first = await client.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    tools: LLM_TOOLS,
+    tool_choice: 'auto',
+    messages,
+  });
+
+  const assistantMsg = first.choices?.[0]?.message;
+  const calls = assistantMsg?.tool_calls ?? [];
+
+  // If no tools were called and content is present, stream it immediately.
+  if (!calls.length) {
+    const content = assistantMsg?.content ?? '';
+    if (content) onChunk(content);
+    return content;
+  }
+
+  const toolMessages = [];
+  for (const call of calls) {
+    const toolName = call.function?.name;
+    const rawArgs = call.function?.arguments;
+
+    try {
+      if (toolName === 'get_system_state') {
+        const state = getSystemState();
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(state) });
+      } else if (toolName === 'get_console_messages') {
+        let limit = 200;
+        if (rawArgs) {
+          try {
+            const parsed = JSON.parse(rawArgs);
+            if (Number.isInteger(parsed?.limit) && parsed.limit >= 1 && parsed.limit <= 500) limit = parsed.limit;
+          } catch { /* ignore */ }
+        }
+        const msgs = await getRecentConsoleMessages(limit);
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ messages: msgs }) });
+      } else if (toolName === 'get_site_incident') {
+        const args = rawArgs ? JSON.parse(rawArgs) : {};
+        const siteId = args?.siteId;
+        const latest = latestIncidentForSite(siteId);
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ incident: latest || null }) });
+      } else if (toolName === 'get_site_state') {
+        try {
+          const args = rawArgs ? JSON.parse(rawArgs) : {};
+          const siteId = args?.siteId;
+          const state = await getTowerState().catch(() => null);
+          const snap = state?.state || state;
+          const site = snap?.sites?.[siteId] || null;
+          const alarms = deriveAlarms(site);
+          toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ site, alarms }) });
+        } catch (err) {
+          toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: String(err?.message || err) }) });
+        }
+      } else if (toolName === 'get_ops_status') {
+        const args = rawArgs ? JSON.parse(rawArgs) : {};
+        const siteId = args?.siteId;
+        const status = currentOpsStatus(siteId || null);
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(status) });
+      } else {
+        toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: `unknown_tool:${toolName || 'n/a'}` }) });
+      }
+    } catch (e) {
+      toolMessages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify({ error: String(e?.message || e || 'tool_error') }) });
+    }
+  }
+
+  const stream = await client.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    stream: true,
+    messages: [
+      ...messages,
+      { role: 'assistant', tool_calls: calls, content: null },
+      ...toolMessages,
+    ],
+  });
+
+  let full = '';
+  for await (const part of stream) {
+    const delta = part?.choices?.[0]?.delta?.content;
+    if (!delta) continue;
+    onChunk(delta);
+    full += delta;
+  }
+  return full;
+}
+
 /* =======================================================================================
  * Command Console endpoints
  * ======================================================================================= */
@@ -372,6 +619,8 @@ app.post('/api/console', async (req, res) => {
     await appendMessage('user', prompt);
 
     let intentData = await classifyIntentLLM(prompt);
+    const inferredSite = siteFromPrompt(prompt);
+    if (inferredSite) recordSiteRef(inferredSite);
     if (!intentData || intentData.intent === 'none') {
       const fbApp = parseApprovalFallback(prompt);
       if (fbApp) intentData = fbApp;
@@ -379,6 +628,80 @@ app.post('/api/console', async (req, res) => {
     if (!intentData || intentData.intent === 'none') {
       const fb = parseSystemIntent(prompt);
       if (fb.match) intentData = { intent: fb.intent, action: fb.action };
+    }
+
+    if ((!intentData || intentData.intent === 'none') && /policy/i.test(prompt)) {
+      const txt = formatPolicySummary();
+      res.write(txt);
+      await appendMessage('assistant', txt);
+      return res.end();
+    }
+
+    // direct policy summary if intent not recognized but user asked about policy
+    if ((!intentData || intentData.intent === 'none') && /policy/i.test(prompt)) {
+      const txt = formatPolicySummary();
+      await appendMessage('assistant', txt);
+      return fresh(res).json(ok({ text: txt }));
+    }
+
+    const siteForFollowup = inferredSite || lastSiteRef;
+    if ((/issue|problem|alarm/i.test(prompt)) ) {
+      const status = currentOpsStatus(siteForFollowup);
+      const state = await getTowerState().catch(() => null);
+      const snap = state?.state || state;
+      const site = siteForFollowup ? snap?.sites?.[siteForFollowup] : null;
+      const alarms = deriveAlarms(site);
+      if (status.unresolvedCount > 0) {
+        const focus = status.focusIncident;
+        if (focus) {
+          const txt = [
+            `Open incident @${focus.siteId}: cause=${focus.cause || 'n/a'}, resolution=${focus.resolution || 'unknown'}, ongoing=${focus.ongoing ? 'yes' : 'no'}.`,
+            `Actions taken: ${(focus.actions || []).length}`,
+            alarms.length ? `Remaining alarms: ${alarms.join(', ')}` : 'Remaining alarms: none observed from latest tower snapshot.',
+            `Other open sites: ${status.unresolvedSites.filter(s => s !== focus.siteId).join(', ') || 'none'}.`,
+          ].join(' ');
+          await appendMessage('assistant', txt);
+          return fresh(res).json(ok({ text: txt, ops: status, alarms }));
+        }
+        const txt = `There are ${status.unresolvedCount} unresolved incident(s) across sites: ${status.unresolvedSites.join(', ') || 'unknown'}.`;
+        await appendMessage('assistant', txt);
+        return fresh(res).json(ok({ text: txt, ops: status }));
+      } else if (siteForFollowup) {
+        const txt = alarms.length
+          ? `Site ${siteForFollowup} alarms: ${alarms.join(', ')}.`
+          : `No active incidents or alarms detected${siteForFollowup ? ` @${siteForFollowup}` : ''}.`;
+        await appendMessage('assistant', txt);
+        return fresh(res).json(ok({ text: txt, site: siteForFollowup, ops: status, alarms }));
+      }
+    }
+    if (/alarm/i.test(prompt) && siteForFollowup) {
+      const state = await getTowerState().catch(() => null);
+      const snap = state?.state || state;
+      const site = snap?.sites?.[siteForFollowup] || null;
+      const alarms = deriveAlarms(site);
+      const txt = site
+        ? (alarms.length ? `Active alarms @${siteForFollowup}: ${alarms.join(', ')}.` : `No active alarms @${siteForFollowup}.`)
+        : `No live state for site ${siteForFollowup}.`;
+      await appendMessage('assistant', txt);
+      return fresh(res).json(ok({ text: txt, site: siteForFollowup, alarms }));
+    }
+
+    if ((/restored|resolved|issue.*(start|appeared)/i.test(prompt) || /status of (site|incident)/i.test(prompt)) && siteForFollowup) {
+      const inc = latestIncidentForSite(siteForFollowup);
+      if (inc) {
+        const txt = `Latest incident @${siteForFollowup}: cause=${inc.cause || 'n/a'}, resolution=${inc.resolution || 'unknown'}, recorded=${inc.ts}.`;
+        await appendMessage('assistant', txt);
+        return fresh(res).json(ok({ text: txt, incident: inc }));
+      }
+    }
+
+    if ((/action|attempt/i.test(prompt)) && siteForFollowup) {
+      const inc = latestIncidentForSite(siteForFollowup);
+      if (inc) {
+        const txt = `Actions for ${siteForFollowup}:\n${formatActions(inc.actions)}`;
+        await appendMessage('assistant', txt);
+        return fresh(res).json(ok({ text: txt, incident: inc }));
+      }
     }
 
     // approvals
@@ -474,17 +797,11 @@ app.post('/api/console', async (req, res) => {
     // agent control (start/stop)
     if (intentData.intent === 'agent_control') {
       const agent = mapAgent(intentData.agent);
-      if (!agent) {
-        const msg = `❓ I couldn't identify the agent ("${intentData.agent}"). Use A/B/C or correlation/troubleshooting/rca.`;
-        await appendMessage('assistant', msg);
-        return fresh(res).status(409).json(ok({ text: msg }));
-      }
-      const op = intentData.action === 'start' ? 'start' : 'stop';
-      const r = await fetch(`http://localhost:8787/api/agents/${agent}/${op}`, { method: 'POST' });
-      const j = await r.json().catch(() => ({}));
-      const ack = r.ok ? `✅ Agent ${agent.toUpperCase()} ${op}ed.` : `⚠️ Could not ${op} agent ${agent.toUpperCase()}.`;
-      await appendMessage('assistant', ack);
-      return fresh(res).status(r.ok ? 200 : 409).json(ok({ text: ack, result: j }));
+      const msg = agent
+        ? `🔒 Agent ${agent.toUpperCase()} lifecycle is governed by the Supervisor. Use supervisor start/pause/resume/stop or policy to change automation.`
+        : `🔒 Agent lifecycle is governed by the Supervisor. Use supervisor controls instead of direct agent commands.`;
+      await appendMessage('assistant', msg);
+      return fresh(res).status(409).json(ok({ text: msg }));
     }
 
     // agent query (status / logs url)
@@ -570,9 +887,15 @@ app.post('/api/console/stream', async (req, res) => {
     req.setTimeout(0);
     res.write('');
 
+    // Register this console stream for global narration (plain text mode)
+    registerStream(res, { mode: 'text' });
+
+
     await appendMessage('user', prompt);
 
     let intentData = await classifyIntentLLM(prompt);
+    const inferredSite = siteFromPrompt(prompt);
+    if (inferredSite) recordSiteRef(inferredSite);
     if (!intentData || intentData.intent === 'none') {
       const fbApp = parseApprovalFallback(prompt);
       if (fbApp) intentData = fbApp;
@@ -580,6 +903,40 @@ app.post('/api/console/stream', async (req, res) => {
     if (!intentData || intentData.intent === 'none') {
       const fb = parseSystemIntent(prompt);
       if (fb.match) intentData = { intent: fb.intent, action: fb.action };
+    }
+
+    const siteForFollowup = inferredSite || lastSiteRef;
+    if (/issue|problem|alarm/i.test(prompt)) {
+      const status = currentOpsStatus(siteForFollowup);
+      const state = await getTowerState().catch(() => null);
+      const snap = state?.state || state;
+      const site = siteForFollowup ? snap?.sites?.[siteForFollowup] : null;
+      const alarms = deriveAlarms(site);
+      if (status.unresolvedCount > 0) {
+        const focus = status.focusIncident;
+        if (focus) {
+          const txt = [
+            `Open incident @${focus.siteId}: cause=${focus.cause || 'n/a'}, resolution=${focus.resolution || 'unknown'}, ongoing=${focus.ongoing ? 'yes' : 'no'}.`,
+            `Actions taken: ${(focus.actions || []).length}`,
+            alarms.length ? `Remaining alarms: ${alarms.join(', ')}` : 'Remaining alarms: none observed from latest tower snapshot.',
+            `Other open sites: ${status.unresolvedSites.filter(s => s !== focus.siteId).join(', ') || 'none'}.`,
+          ].join(' ');
+          res.write(txt);
+          await appendMessage('assistant', txt);
+          return res.end();
+        }
+        const txt = `There are ${status.unresolvedCount} unresolved incident(s) across sites: ${status.unresolvedSites.join(', ') || 'unknown'}.`;
+        res.write(txt);
+        await appendMessage('assistant', txt);
+        return res.end();
+      } else if (siteForFollowup) {
+        const txt = alarms.length
+          ? `Site ${siteForFollowup} alarms: ${alarms.join(', ')}.`
+          : `No active incidents or alarms detected${siteForFollowup ? ` @${siteForFollowup}` : ''}.`;
+        res.write(txt);
+        await appendMessage('assistant', txt);
+        return res.end();
+      }
     }
 
     // approvals (stream)
@@ -687,18 +1044,11 @@ app.post('/api/console/stream', async (req, res) => {
     // agent control / query (stream)
     if (intentData.intent === 'agent_control') {
       const agent = mapAgent(intentData.agent);
-      if (!agent) {
-        const msg = `❓ I couldn't identify the agent ("${intentData.agent}"). Use A/B/C or correlation/troubleshooting/rca.`;
-        await appendMessage('assistant', msg);
-        return res.end(msg);
-      }
-      const op = intentData.action === 'start' ? 'start' : 'stop';
-      const r = await fetch(`http://localhost:8787/api/agents/${agent}/${op}`, { method: 'POST' });
-      const j = await r.json().catch(() => ({}));
-      res.write(`[[SIDE_EFFECT]]${JSON.stringify({ agent: agent.toUpperCase(), op, result: j })}\n`);
-      const ack = r.ok ? `✅ Agent ${agent.toUpperCase()} ${op}ed.` : `⚠️ Could not ${op} agent ${agent.toUpperCase()}.`;
-      await appendMessage('assistant', ack);
-      return res.end(ack);
+      const msg = agent
+        ? `🔒 Agent ${agent.toUpperCase()} lifecycle is governed by the Supervisor. Use supervisor start/pause/resume/stop or policy to change automation.`
+        : `🔒 Agent lifecycle is governed by the Supervisor. Use supervisor controls instead of direct agent commands.`;
+      await appendMessage('assistant', msg);
+      return res.end(msg);
     }
     if (intentData.intent === 'agent_query') {
       const agent = mapAgent(intentData.agent);
@@ -750,17 +1100,22 @@ app.post('/api/console/stream', async (req, res) => {
       'Do not guess numeric values.',
     ].join(' ');
 
-    const text = await runLLMWithTools([
-      { role: 'system', content: sysGuard },
-      { role: 'system', content: sysLine },
-      { role: 'system', content: memoryPreamble },
-      ...(system ? [{ role: 'system', content: system }] : []),
-      ...recent,
-      { role: 'user', content: prompt },
-    ]);
+  const messages = [
+    { role: 'system', content: sysGuard },
+    { role: 'system', content: sysLine },
+    { role: 'system', content: memoryPreamble },
+    { role: 'system', content: `LAST_SITE ${lastSiteRef || 'unknown'}` },
+    ...(system ? [{ role: 'system', content: system }] : []),
+    ...recent,
+    { role: 'user', content: prompt },
+  ];
 
-    res.write(text || '');
-    await appendMessage('assistant', text || '');
+    let fullText = '';
+    fullText = await runLLMWithToolsStream(messages, (delta) => {
+      try { res.write(delta); } catch { /* ignore broken pipe */ }
+    });
+
+    await appendMessage('assistant', fullText || '');
     return res.end();
   } catch (err0) {
     console.error('Stream error:', err0);
